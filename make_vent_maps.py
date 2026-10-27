@@ -101,6 +101,9 @@ SITE_URL = os.environ.get('SITE_URL', '').rstrip('/')
 # ---- Time window ------------------------------------------------------------------------
 DAYS = 7                                # number of forecast days (panels) per map
 LOCAL_TZ = ZoneInfo('America/Phoenix')  # MST all year; decides what "today" (Day 1) is
+# Time zone for the small "Issued" time in the legend panel (bottom right) of every map.
+# America/Denver shows MDT in summer and MST in winter; use 'America/Phoenix' for MST all year.
+ISSUED_TZ = ZoneInfo('America/Denver')
 # Hours (UTC) used each day.
 # 18 = 11 AM MST, 21 = 2 PM MST, 24 = 5 PM MST (midnight UTC of the next day).
 AFTERNOON_UTC_HOURS = [18, 21, 24]
@@ -542,7 +545,7 @@ def day_label(day):
 
 
 def legend_panel(ax, cycle):
-    """The 8th (bottom-right) panel: color legend + model run info."""
+    """The 8th (bottom-right) panel: color legend, issued time, model run."""
     ax.axis('off')
     handles = [Patch(facecolor=c, edgecolor='black',
                      label=f'{n}  ({CAT_BOUNDS[i] // 1000}K–{CAT_BOUNDS[i + 1] // 1000}K)'
@@ -550,11 +553,22 @@ def legend_panel(ax, cycle):
                for i, (n, c) in enumerate(zip(CAT_NAMES, CAT_COLORS))]
     ax.legend(handles=handles, loc='upper center', title='Ventilation (knot-ft)',
               fontsize=10, title_fontsize=11, frameon=False)
-    ax.text(0.5, 0.18,
-            f'Model run: {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year}\n'
-            f'{METHOD_TEXT[AFTERNOON_METHOD]["legend"]}\n'
-            f'Categories: NM smoke management',
+    # Small gray "Issued" time (when GitHub ran the script), just above the model run
+    ax.text(0.5, 0.24, issued_text(), ha='center', va='center',
+            fontsize=8, color='#555555', transform=ax.transAxes)
+    ax.text(0.5, 0.17, f'Model run: {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year}',
             ha='center', va='center', fontsize=9, transform=ax.transAxes)
+
+
+ISSUED = dt.datetime.now(dt.timezone.utc)   # set once when the run starts (see main())
+
+
+def issued_text():
+    """'Issued ...' line shown in the legend panel (bottom right), above the model run.
+       Size/color are set in legend_panel(); time zone is ISSUED_TZ in SECTION 1."""
+    t = ISSUED.astimezone(ISSUED_TZ)
+    hour = t.strftime('%I').lstrip('0')            # 7 instead of 07
+    return f'Issued {hour}:{t:%M %p %Z} {t:%a} {t.month}/{t.day}/{t.year}'
 
 
 def draw_field(ax, data):
@@ -877,6 +891,8 @@ def main():
     # Step 2: pick the NBM run (SECTION 3). Day 1 = today in Arizona time.
     today = dt.datetime.now(LOCAL_TZ).date()
     days = [today + dt.timedelta(days=i) for i in range(DAYS)]
+    global ISSUED
+    ISSUED = dt.datetime.now(dt.timezone.utc)      # "Issued" time stamped on every map
     cycle = pick_cycle(days)
     print(f'Using NBM {cycle:%Y-%m-%d %H}Z')
 
