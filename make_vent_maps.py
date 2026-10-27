@@ -93,7 +93,7 @@ from shapely.ops import unary_union, linemerge
 
 # ---- Output / webpage -----------------------------------------------------------------
 OUTPUT_DIR = 'site'                     # folder GitHub publishes as the webpage
-PAGE_TITLE = 'NBM Ventilation Rate — Arizona & New Mexico PSAs'
+PAGE_TITLE = 'Ventilation Rate — Arizona & New Mexico PSAs'
 # Address of the live webpage. The GitHub workflow fills this in; it's used to fetch
 # yesterday's saved PSA boundaries as a last-resort backup.
 SITE_URL = os.environ.get('SITE_URL', '').rstrip('/')
@@ -499,7 +499,7 @@ def legend_panel(ax, cycle):
     ax.legend(handles=handles, loc='upper center', title='Ventilation (knot-ft)',
               fontsize=10, title_fontsize=11, frameon=False)
     ax.text(0.5, 0.18,
-            f'NBM {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} run\n'
+            f'Model run: {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year}\n'
             f'Daily max\n'
             f'Categories: NM smoke management',
             ha='center', va='center', fontsize=9, transform=ax.transAxes)
@@ -667,7 +667,7 @@ def make_overview(psas, neighbors, days, fields, cycle):
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=0.5))
         ax.set_title(f'Day {i + 1}: {day_label(day)}', fontsize=11, fontweight='bold')
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
-    fig.suptitle('NBM Max Afternoon Ventilation Rate — Arizona & New Mexico PSAs',
+    fig.suptitle('Max Afternoon Ventilation Rate — Arizona & New Mexico PSAs',
                  fontsize=16, fontweight='bold')
     # Spacing between panels. hspace = gap between the two rows (raise it if a
     # day title touches the map above); top = room for the big title.
@@ -713,7 +713,7 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
 
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
     title = f"{psa['code']} {psa['name']}".strip()
-    fig.suptitle(f'{title} — NBM Max Afternoon Ventilation Rate', fontsize=16, fontweight='bold')
+    fig.suptitle(f'{title} — Max Afternoon Ventilation Rate', fontsize=16, fontweight='bold')
     # Spacing between panels. hspace = gap between the two rows; these titles are two
     # lines, so the gap is bigger. Raise hspace if a title touches the map above.
     fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.88, wspace=0.06, hspace=0.34)
@@ -791,13 +791,13 @@ def write_index_html(psas, days, cycle):
 <header>
   <h1>{esc(PAGE_TITLE)}</h1>
   <div class="meta">Days 1–7 ({day_label(days[0])} – {day_label(days[-1])}) ·
-    NBM {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} run ·
+    model run {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} ·
     daily max · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
 </header>
 <nav><div class="inner">{''.join(nav)}</div></nav>
 <main>
 {chr(10).join(sections)}
-<p class="note">Ventilation rate = mixing height × transport wind, from the National Blend of Models (NBM),
+<p class="note">Ventilation rate = mixing height × transport wind, from the National Blend of Models,
 converted to knot-feet. Categories follow the New Mexico smoke management table:
 Poor &lt;40K, Fair 40–60K, Good 60–100K, Very Good 100–150K, Excellent ≥150K.
 PSA boundaries: NIFC. Each PSA panel shows the median value inside the PSA.</p>
