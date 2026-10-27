@@ -1,17 +1,66 @@
 """
-NBM max afternoon ventilation rate maps for the Arizona / New Mexico
-Predictive Service Areas (PSAs), Days 1-7.
+=====================================================================================
+ NBM VENTILATION RATE MAPS — Arizona / New Mexico PSAs, Days 1–7
+=====================================================================================
 
-Builds a small website in site/:
-  index.html               - the webpage (overview + one section per PSA)
-  vent_overview.png        - all AZ/NM PSAs, Days 1-7
-  vent_<PSA>.png           - one image per PSA, Days 1-7
-  psa_boundaries.geojson   - copy of the PSA boundaries (backup if NIFC is down)
+WHAT THIS DOES
+  Every morning GitHub runs this script. It:
+    1. Loads the PSA (Predictive Service Area) boundaries            -> SECTION 2
+    2. Finds the newest NBM model run and downloads ventilation rate -> SECTION 3
+    3. Takes the afternoon max for each of Days 1–7                  -> SECTION 3
+    4. Draws one overview map + one map per Southwest PSA           -> SECTIONS 4–6
+    5. Writes the webpage (index.html)                              -> SECTION 7
+  Everything is saved in the "site" folder, which GitHub publishes as the webpage.
 
-Run daily by GitHub Actions and published with GitHub Pages
-(see .github/workflows/vent-maps.yml). Can also be run by hand:
-  python make_vent_maps.py      then open site/index.html
+RUN IT BY HAND (optional, on your own computer)
+    pip install -r requirements.txt
+    python make_vent_maps.py          then open site/index.html
+
+-------------------------------------------------------------------------------------
+ TROUBLESHOOTING — "something broke, where do I look?"
+-------------------------------------------------------------------------------------
+ Open the failed GitHub run > build-and-publish > "Make the maps and webpage" and find
+ the last lines printed. Then match the message below:
+
+ "Could not get PSA boundaries ..."
+     The psa_boundaries.geojson file is missing from the repo AND NIFC's servers failed.
+     Fix: upload psa_boundaries.geojson again.            Code: SECTION 2, fetch_psa_geojson()
+
+ "PSAs mapped:" lists the wrong PSAs (or none)
+     The PSA file's field names or GACC ID changed.
+     Fix: check MAP_GACC_ID / INCLUDE_PSAS / EXCLUDE_PSAS. Code: SECTION 1 settings,
+     SECTION 2 load_psas(). The log line "PSA attribute fields:" shows the field names.
+
+ "No recent NBM cycle found on AWS or NOMADS."
+     NOAA changed the NBM folder/file names, or both servers are down.
+     Fix: check the address pattern.                      Code: SECTION 3, nbm_url()
+
+ "fXXX: no VRATE in this file"  /  every day says "No data"
+     NOAA renamed the ventilation variable inside the files.
+     Fix: check the name 'VRATE'.                          Code: SECTION 3, vrate_byte_range()
+
+ "Roads: could not load ..."
+     The Natural Earth roads download failed. Maps still build, just without roads.
+     Fix: usually goes away on the next run.               Code: SECTION 5, load_roads()
+
+ Maps look wrong (colors, labels, crowding, zoom)
+     Colors/categories -> SECTION 1 (CAT_...)
+     Road markers      -> SECTION 1 (road settings) and SECTION 5 draw_roads()
+     Overview layout   -> SECTION 6 make_overview()
+     PSA map layout    -> SECTION 6 make_psa_map()
+
+ Webpage text or look
+     -> SECTION 7 (PAGE_CSS and write_index_html)
+
+ The run never starts / wrong time
+     -> not this file: see .github/workflows/vent-maps.yml (schedule times are UTC)
+=====================================================================================
 """
+
+# -------------------------------------------------------------------------------------
+# Python packages. If GitHub says "ModuleNotFoundError: No module named X",
+# add X to requirements.txt.
+# -------------------------------------------------------------------------------------
 import os
 import re
 import sys
@@ -22,66 +71,88 @@ import zipfile
 import datetime as dt
 from zoneinfo import ZoneInfo
 
-import numpy as np
-import requests
+import numpy as np                      # number crunching on the grid
+import requests                         # downloads (NBM, NIFC)
 import matplotlib
-matplotlib.use('Agg')
+matplotlib.use('Agg')                   # draw to image files (no screen on GitHub)
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 from matplotlib.patches import Patch
-import cartopy.crs as ccrs
-import cartopy.io.shapereader as shpreader
-from metpy.plots import USCOUNTIES, USSTATES
-import pygrib
-import shapely
+import cartopy.crs as ccrs              # map projections
+import cartopy.io.shapereader as shpreader   # Natural Earth downloads (states, roads)
+from metpy.plots import USCOUNTIES, USSTATES  # county and state outlines
+import pygrib                           # reads NBM GRIB2 files
+import shapely                          # PSA polygon math
 from shapely.geometry import shape
 from shapely.ops import unary_union, linemerge
 
-# ---- Settings ----------------------------------------------------------------
-OUTPUT_DIR = 'site'
+
+# =====================================================================================
+# SECTION 1 — SETTINGS  (most day-to-day changes happen here)
+# =====================================================================================
+
+# ---- Output / webpage -----------------------------------------------------------------
+OUTPUT_DIR = 'site'                     # folder GitHub publishes as the webpage
 PAGE_TITLE = 'NBM Ventilation Rate — Arizona & New Mexico PSAs'
-# The live site (set by the GitHub workflow); its saved PSA boundaries are the backup copy.
+# Address of the live webpage. The GitHub workflow fills this in; it's used to fetch
+# yesterday's saved PSA boundaries as a last-resort backup.
 SITE_URL = os.environ.get('SITE_URL', '').rstrip('/')
-DAYS = 7
-LOCAL_TZ = ZoneInfo('America/Phoenix')       # MST all year
-AFTERNOON_UTC_HOURS = [18, 21, 24]           # 11 AM, 2 PM, 5 PM MST -> daily max of these
-AFTERNOON_TEXT = '11 AM, 2 PM, 5 PM MST'
-MIN_FRACTION_IN_AZ_NM = 0.5                  # (only used if the file has no GACC field)
 
-# Which PSAs get their own maps: those in this GACC. Every other PSA near AZ/NM
-# (Great Basin, Rocky Mtn, Southern Area, So Cal) is drawn as a gray outline for context.
-MAP_GACC_ID = 'USNMSWC'                      # Southwest Coordination Center
-SHOW_NEIGHBOR_OUTLINES = True
+# ---- Time window ------------------------------------------------------------------------
+DAYS = 7                                # number of forecast days (panels) per map
+LOCAL_TZ = ZoneInfo('America/Phoenix')  # MST all year; decides what "today" (Day 1) is
+# Hours (UTC) checked each day; the map shows the HIGHEST of these.
+# 18 = 11 AM MST, 21 = 2 PM MST, 24 = 5 PM MST (midnight UTC of the next day).
+AFTERNOON_UTC_HOURS = [18, 21, 24]
 
-# Roads (Natural Earth 1:10m, downloaded automatically)
-SHOW_ROADS = True
-OVERVIEW_ROAD_LEVELS = ['Interstate']                 # overview panels are small: interstates only
-PSA_ROAD_LEVELS = ['Interstate', 'Federal']           # PSA maps: interstates + US highways
-
-# PSA codes to always skip or always include.
-EXCLUDE_PSAS = set()
+# ---- Which PSAs get maps ------------------------------------------------------------
+# PSAs whose GACCUnitID matches this get their own map. Every other PSA nearby
+# (Great Basin, Rocky Mtn, Southern Area, So Cal) is drawn only as a gray outline.
+MAP_GACC_ID = 'USNMSWC'                 # Southwest Coordination Center
+SHOW_NEIGHBOR_OUTLINES = True           # False = don't draw the neighboring PSAs at all
+# Force a PSA in or out by its code, e.g. INCLUDE_PSAS = {'GB35'}, EXCLUDE_PSAS = {'SW03'}
 INCLUDE_PSAS = set()
+EXCLUDE_PSAS = set()
+# Only used if a PSA file ever has NO GACC field: keep PSAs at least this much inside AZ/NM.
+MIN_FRACTION_IN_AZ_NM = 0.5
 
-# Data area (bigger than AZ/NM so edge PSAs and the bordering PSAs are covered)
+# ---- Roads (Natural Earth 1:10m, downloaded automatically) -------------------------------
+SHOW_ROADS = True                       # False = no roads anywhere
+OVERVIEW_ROAD_LEVELS = []               # overview map: no roads (too cluttered)
+#   to put interstates back on the overview: ['Interstate']
+PSA_ROAD_LEVELS = ['Interstate', 'Federal']   # PSA maps: interstates + US highways
+#   'Interstate' = I-10, I-25, I-40...   'Federal' = US 60, US 70, US 285...
+
+# ---- Map area ----------------------------------------------------------------------------
+# Area of NBM data that is downloaded/kept (a bit bigger than AZ/NM so edge PSAs and
+# the bordering PSAs have data). Make this bigger if a map edge shows blank.
 lat_min, lat_max = 30.0, 38.4
 lon_min, lon_max = -116.8, -101.0
-# What the overview map shows (AZ/NM plus a strip of the neighboring PSAs)
+# What the overview map shows: [west, east, south, north]
 OVERVIEW_EXTENT = [-115.9, -101.8, 30.7, 37.9]
 
-# Smoke management categories (knot-ft), New Mexico AQB table
+# ---- Colors / categories (knot-ft), New Mexico AQB smoke management table -----------
+# CAT_BOUNDS are the edges between categories; one more number than CAT_NAMES.
 CAT_BOUNDS = [0, 40000, 60000, 100000, 150000, 10_000_000]
 CAT_NAMES = ['Poor', 'Fair', 'Good', 'Very Good', 'Excellent']
-CAT_COLORS = ['#7B3294', '#1F3A93', '#2E9E44', '#F2D300', '#D7191C']
+CAT_COLORS = ['#7B3294', '#1F3A93', '#2E9E44', '#F2D300', '#D7191C']   # purple, blue, green, yellow, red
 cmap = mcolors.ListedColormap(CAT_COLORS)
 norm = mcolors.BoundaryNorm(CAT_BOUNDS, cmap.N)
 
-MPS_TO_KTFT = (1 / 0.514444) * (1 / 0.3048)    # m^2/s -> knot-feet
+# NBM gives ventilation in m²/s; this converts to knot-feet.
+MPS_TO_KTFT = (1 / 0.514444) * (1 / 0.3048)
 
+# ---- Data sources -------------------------------------------------------------------------
+# NBM files are tried on AWS first, then NOAA's NOMADS server.
+# If NOAA moves the files, update these and/or nbm_url() in SECTION 3.
 NBM_SOURCES = [
     'https://noaa-nbm-grib2-pds.s3.amazonaws.com',
     'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod',
 ]
-PSA_SERVICES = [   # NIFC PSA boundary services, newest first
+# PSA boundaries: the copy uploaded to the repo is ALWAYS used first (no download).
+# The NIFC addresses below are only a backup if that file is missing.
+PSA_REPO_COPIES = ['psa_boundaries.geojson', 'psa_boundaries.zip']
+PSA_SERVICES = [   # NIFC online services, newest first
     'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/'
     'DMP_Predictive_Service_Area__PSA_Boundaries_Public/FeatureServer',
     'https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/'
@@ -91,14 +162,19 @@ PSA_GEOJSON_URLS = [
     'https://data-nifc.opendata.arcgis.com/datasets/nifc::predictive-service-area-psa-boundaries-public.geojson',
     'https://data-nifc.opendata.arcgis.com/datasets/nifc::national-predictive-service-areas-psa-boundaries.geojson',
 ]
+# A small copy of the PSAs actually used is saved with the webpage each run.
 PSA_CACHE = os.path.join(OUTPUT_DIR, 'psa_boundaries.geojson')
-# A copy uploaded to the repo itself, plain or zipped. If one exists, it is always used (no download).
-PSA_REPO_COPIES = ['psa_boundaries.geojson', 'psa_boundaries.zip']
 
 
-# ---- PSA boundaries ------------------------------------------------------------
+# =====================================================================================
+# SECTION 2 — PSA BOUNDARIES
+# Loads the PSA outlines and splits them into:
+#   psas      = Southwest PSAs that get their own map
+#   neighbors = nearby PSAs from other GACCs (gray outlines only)
+# =====================================================================================
+
 def read_repo_copy(path):
-    """Read psa_boundaries.geojson, or the first .geojson/.json file inside psa_boundaries.zip."""
+    """Read psa_boundaries.geojson, or the first .geojson file inside psa_boundaries.zip."""
     if path.lower().endswith('.zip'):
         with zipfile.ZipFile(path) as z:
             inner = [n for n in z.namelist()
@@ -112,13 +188,19 @@ def read_repo_copy(path):
 
 
 def fetch_psa_geojson():
-    # A copy uploaded to the repo always wins, so NIFC's servers aren't needed at all.
+    """Get the PSA boundaries. Order tried:
+         1. psa_boundaries.geojson / .zip uploaded to the repo   <- normal case
+         2. NIFC online services and downloads                    <- backup
+         3. yesterday's copy saved on the webpage                 <- last resort
+    """
+    # 1. Repo copy (normal case)
     for path in PSA_REPO_COPIES:
         if os.path.exists(path):
             gj = read_repo_copy(path)
             print(f'PSA boundaries from the repo copy {path}: {len(gj.get("features", []))} features')
             return gj
 
+    # 2. NIFC online (only if the repo copy is missing)
     params = {
         'where': '1=1', 'outFields': '*', 'outSR': '4326', 'f': 'geojson',
         'geometry': f'{lon_min},{lat_min},{lon_max},{lat_max}',
@@ -132,6 +214,7 @@ def fetch_psa_geojson():
             attempts.append((url, lambda u=url: requests.get(u, params=params, timeout=60)))
     for url in PSA_GEOJSON_URLS:
         attempts.append((url, lambda u=url: requests.get(u, timeout=120)))
+    # 3. Yesterday's copy on the live webpage
     if SITE_URL:
         url = f'{SITE_URL}/psa_boundaries.geojson'
         attempts.append((url, lambda u=url: requests.get(u, timeout=60)))
@@ -141,7 +224,7 @@ def fetch_psa_geojson():
             r = get()
             r.raise_for_status()
             gj = r.json()
-            if gj.get('error'):
+            if gj.get('error'):                       # ArcGIS reports errors inside a "200 OK"
                 raise RuntimeError(gj['error'])
             if gj.get('features'):
                 print(f'PSA boundaries from {label}: {len(gj["features"])} features')
@@ -157,13 +240,17 @@ def fetch_psa_geojson():
     raise RuntimeError('Could not get PSA boundaries from NIFC and no saved copy exists.')
 
 
+# Field names the PSA code / name might be stored under. NIFC's current file uses
+# PSANationalCode (e.g. "SW05") and PSANAME (e.g. "Western Mogollon Rim").
+# If NIFC renames them, add the new name to these lists.
 CODE_FIELDS = ['PSANationalCode', 'PSANATCODE', 'PSA_NAT_CODE', 'PSA_ID', 'PSAID',
                'PSACode', 'PSA_CODE', 'PSANumber', 'PSA_NUM', 'PSA']
 NAME_FIELDS = ['PSAName', 'PSA_NAME', 'PSANAME', 'Name', 'NAME']
-PSA_CODE_PATTERN = re.compile(r'^[A-Z]{2}\d{1,3}[A-Z]?$')   # e.g. SW05, SW06N
+PSA_CODE_PATTERN = re.compile(r'^[A-Z]{2}\d{1,3}[A-Z]?$')   # what a PSA code looks like: SW05, SW06N
 
 
 def first_value(props, keys):
+    """Return the first non-empty value among these field names (not case-sensitive)."""
     for k in keys:
         for pk, v in props.items():
             if pk.lower() == k.lower() and v not in (None, ''):
@@ -172,7 +259,7 @@ def first_value(props, keys):
 
 
 def guess_code(props):
-    """If the code field has an unexpected name, find a value that looks like a PSA code."""
+    """Backup: if the code field has an unexpected name, find a value that looks like a PSA code."""
     for v in props.values():
         if isinstance(v, str) and PSA_CODE_PATTERN.match(v.strip()):
             return v.strip()
@@ -180,6 +267,7 @@ def guess_code(props):
 
 
 def az_nm_shape():
+    """AZ + NM outline (Natural Earth). Only needed if the PSA file has no GACC field."""
     path = shpreader.natural_earth(resolution='50m', category='cultural',
                                    name='admin_1_states_provinces_lakes')
     geoms = [rec.geometry for rec in shpreader.Reader(path).records()
@@ -189,8 +277,9 @@ def az_nm_shape():
 
 
 def load_psas():
-    """Returns (psas, neighbors): PSAs that get maps, and nearby PSAs drawn as outlines only."""
+    """Returns (psas, neighbors). See SECTION 1 'Which PSAs get maps' to change the choice."""
     gj = fetch_psa_geojson()
+    # Printed so you can see the field names in the GitHub log if something changes.
     print('PSA attribute fields:', gj['features'][0].get('properties', {}))
     has_gacc = any(first_value(f.get('properties') or {}, ['GACCUnitID']) for f in gj['features'])
     azm = None if has_gacc else az_nm_shape()
@@ -201,28 +290,35 @@ def load_psas():
         if not feat.get('geometry'):
             continue
         geom = shape(feat['geometry'])
+
+        # Skip PSAs nowhere near AZ/NM (matters if the full national file is uploaded)
         bx0, by0, bx1, by1 = geom.bounds
         if bx1 < lon_min or bx0 > lon_max or by1 < lat_min or by0 > lat_max:
-            continue                            # nowhere near AZ/NM (quick skip for the national file)
+            continue
         if not geom.is_valid:
-            geom = geom.buffer(0)
+            geom = geom.buffer(0)                      # repairs small polygon errors
+
         code = first_value(props, CODE_FIELDS) or guess_code(props)
         name = first_value(props, NAME_FIELDS)
         if not code:
             continue
+
+        # Southwest PSA (gets a map) or neighbor (outline only)?
         if has_gacc:
             in_area = first_value(props, ['GACCUnitID']) == MAP_GACC_ID
         else:
             in_area = (geom.intersection(azm).area / geom.area if geom.area else 0) >= MIN_FRACTION_IN_AZ_NM
         keep = (in_area or code in INCLUDE_PSAS) and code not in EXCLUDE_PSAS
+
         item = {'code': code, 'name': name, 'geom': geom, 'feature': feat,
-                'file': f"vent_{re.sub(r'[^A-Za-z0-9]', '', code)}.png"}
+                'file': f"vent_{re.sub(r'[^A-Za-z0-9]', '', code)}.png"}   # image file name, e.g. vent_SW05.png
         (psas if keep else neighbors).append(item)
+
     psas.sort(key=lambda p: p['code'])
     if not SHOW_NEIGHBOR_OUTLINES:
         neighbors = []
 
-    # Save the PSAs used here as a small backup copy on the website
+    # Save the PSAs used here with the webpage (backup copy for a future run)
     with open(PSA_CACHE, 'w') as f:
         json.dump({'type': 'FeatureCollection',
                    'features': [p['feature'] for p in psas + neighbors]}, f)
@@ -231,14 +327,23 @@ def load_psas():
     return psas, neighbors
 
 
-# ---- NBM data --------------------------------------------------------------------
+# =====================================================================================
+# SECTION 3 — NBM DATA
+# NBM files are large, so only the ventilation (VRATE) piece of each file is downloaded,
+# using the small ".idx" index file that lists where each variable sits in the file.
+# =====================================================================================
+
 def nbm_url(base, cycle, fhr):
+    """Address of one NBM CONUS 'core' file, e.g.
+       .../blend.20261027/12/core/blend.t12z.core.f030.co.grib2
+       If NOAA changes its folder or file naming, THIS is the line to fix."""
     return (f'{base}/blend.{cycle:%Y%m%d}/{cycle:%H}/core/'
             f'blend.t{cycle:%H}z.core.f{fhr:03d}.co.grib2')
 
 
 def get_idx(cycle, fhr):
-    """Returns (grib_url, idx_text) from the first source that has the file, else (None, None)."""
+    """Download the .idx index for one forecast hour. Tries each server in NBM_SOURCES.
+       Returns (grib_url, idx_text), or (None, None) if no server has it yet."""
     for base in NBM_SOURCES:
         url = nbm_url(base, cycle, fhr)
         try:
@@ -251,28 +356,35 @@ def get_idx(cycle, fhr):
 
 
 def vrate_byte_range(idx_text):
-    """Find the VRATE message in a GRIB2 .idx file -> (start, end) bytes; end may be None."""
+    """Find the ventilation rate (VRATE) entry in the .idx file -> (start byte, end byte).
+       An .idx line looks like:  123:45678901:d=2026102712:VRATE:entire atmosphere ...:6 hour fcst:
+       If NOAA renames the variable, change 'VRATE' here."""
     lines = [l for l in idx_text.strip().splitlines() if l.strip()]
     for i, line in enumerate(lines):
         parts = line.split(':')
         if len(parts) > 4 and parts[3] == 'VRATE' and 'std dev' not in line and 'prob' not in line:
             start = int(parts[1])
+            # The piece ends where the next entry starts (or at the end of the file)
             end = int(lines[i + 1].split(':')[1]) - 1 if i + 1 < len(lines) else None
             return start, end
     return None
 
 
 def valid_times_for_day(day):
+    """The afternoon times (UTC) checked for one day; see AFTERNOON_UTC_HOURS in SECTION 1."""
     base = dt.datetime(day.year, day.month, day.day, tzinfo=dt.timezone.utc)
     return [base + dt.timedelta(hours=h) for h in AFTERNOON_UTC_HOURS]
 
 
 def fhr_for(cycle, valid):
+    """Forecast hour = hours from the model run time to the valid time."""
     return int((valid - cycle).total_seconds() // 3600)
 
 
 def pick_cycle(days):
-    """Newest NBM cycle that already has the Day 7 afternoon file posted."""
+    """Choose the newest NBM run that already has its Day 7 file posted.
+       Tries today's 18Z, 12Z, 06Z, 00Z, then yesterday's 18Z, 12Z.
+       Runs less than 45 minutes old are skipped (not posted yet)."""
     now = dt.datetime.now(dt.timezone.utc)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     candidates = sorted(
@@ -283,10 +395,10 @@ def pick_cycle(days):
 
     last_valid = valid_times_for_day(days[-1])[-1]
     first_valid = valid_times_for_day(days[0])[0]
-    for c in candidates:
+    for c in candidates:                       # best: a run that reaches Day 7
         if get_idx(c, fhr_for(c, last_valid))[0]:
             return c
-    for c in candidates:                       # fallback: at least Day 1 is posted
+    for c in candidates:                       # fallback: a run with at least Day 1
         f = fhr_for(c, first_valid)
         if f >= 1 and get_idx(c, f)[0]:
             return c
@@ -294,12 +406,14 @@ def pick_cycle(days):
 
 
 class Grid:
+    """Latitude/longitude of the NBM grid points kept (AZ/NM area). Filled on first read."""
     lats = lons = sl = None
 
 
 def read_vrate(cycle, fhr):
-    """Download just the VRATE message; returns knot-ft on the AZ/NM subset, or None."""
-    if fhr < 1 or fhr > 264:
+    """Download just the VRATE piece for one forecast hour.
+       Returns the ventilation grid in knot-ft (AZ/NM area only), or None if not available."""
+    if fhr < 1 or fhr > 264:                   # NBM core files run f001–f264
         return None
     url, idx = get_idx(cycle, fhr)
     if not url:
@@ -309,11 +423,14 @@ def read_vrate(cycle, fhr):
     if not rng:
         print(f'  f{fhr:03d}: no VRATE in this file')
         return None
+
+    # Download only the bytes for VRATE (a "Range" request)
     start, end = rng
     headers = {'Range': f'bytes={start}-{end if end is not None else ""}'}
     r = requests.get(url, headers=headers, timeout=120)
     r.raise_for_status()
 
+    # pygrib needs a file on disk, so save the piece to a temporary file
     with tempfile.NamedTemporaryFile(suffix='.grib2', delete=False) as tmp:
         tmp.write(r.content)
         path = tmp.name
@@ -322,6 +439,7 @@ def read_vrate(cycle, fhr):
         g = grbs.message(1)
         vals = np.ma.filled(np.ma.asarray(g.values, dtype=float), np.nan)
         if Grid.sl is None:
+            # First file only: work out which grid rows/columns cover the AZ/NM area
             lats, lons = g.latlons()
             lons = np.where(lons > 180, lons - 360, lons)
             inside = (lats >= lat_min) & (lats <= lat_max) & (lons >= lon_min) & (lons <= lon_max)
@@ -334,11 +452,12 @@ def read_vrate(cycle, fhr):
         os.remove(path)
 
     vals = vals[Grid.sl]
-    vals[vals > 1e6] = np.nan                  # missing-value codes
-    return vals * MPS_TO_KTFT
+    vals[vals > 1e6] = np.nan                  # NBM marks missing points with huge numbers
+    return vals * MPS_TO_KTFT                  # m²/s -> knot-ft
 
 
 def daily_max(cycle, day):
+    """Highest ventilation of the afternoon hours for one day (per grid point)."""
     fields = []
     for valid in valid_times_for_day(day):
         f = fhr_for(cycle, valid)
@@ -346,13 +465,17 @@ def daily_max(cycle, day):
         if v is not None:
             fields.append(v)
     if not fields:
-        return None
+        return None                            # shows as "No data" on the map
     with np.errstate(all='ignore'):
         return np.fmax.reduce(fields)
 
 
-# ---- Drawing ---------------------------------------------------------------------
+# =====================================================================================
+# SECTION 4 — SHARED DRAWING PIECES (legend, colors, category names)
+# =====================================================================================
+
 def category(v):
+    """Knot-ft value -> category name (Poor ... Excellent), using CAT_BOUNDS."""
     if v is None or np.isnan(v):
         return '—'
     for i in range(len(CAT_NAMES)):
@@ -362,10 +485,12 @@ def category(v):
 
 
 def day_label(day):
+    """Date as shown on the maps, e.g. 'Tue 10/27'."""
     return f'{day:%a} {day.month}/{day.day}'
 
 
 def legend_panel(ax, cycle):
+    """The 8th (bottom-right) panel: color legend + model run info."""
     ax.axis('off')
     handles = [Patch(facecolor=c, edgecolor='black',
                      label=f'{n}  ({CAT_BOUNDS[i] // 1000}K–{CAT_BOUNDS[i + 1] // 1000}K)'
@@ -375,12 +500,13 @@ def legend_panel(ax, cycle):
               fontsize=10, title_fontsize=11, frameon=False)
     ax.text(0.5, 0.18,
             f'NBM {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} run\n'
-            f'Daily max of {AFTERNOON_TEXT}\n'
+            f'Daily max\n'
             f'Categories: NM smoke management',
             ha='center', va='center', fontsize=9, transform=ax.transAxes)
 
 
 def draw_field(ax, data):
+    """The colored ventilation grid for one day (or 'No data')."""
     if data is None:
         ax.text(0.5, 0.5, 'No data', ha='center', va='center', fontsize=12, transform=ax.transAxes)
         return
@@ -389,14 +515,22 @@ def draw_field(ax, data):
 
 
 def psa_mask(geom):
+    """True for grid points inside a PSA (used for the PSA median)."""
     return shapely.contains_xy(geom, Grid.lons, Grid.lats)
 
 
-ROADS = None
+# =====================================================================================
+# SECTION 5 — ROADS AND NEIGHBOR OUTLINES
+# Roads come from Natural Earth (downloaded automatically, then cached).
+# Which roads show on which map is set in SECTION 1 (OVERVIEW_ROAD_LEVELS, PSA_ROAD_LEVELS).
+# =====================================================================================
+
+ROADS = None   # filled the first time load_roads() runs, then reused for every map
 
 
 def load_roads():
-    """Interstates and US highways near AZ/NM from Natural Earth -> {(level, number): geometry}."""
+    """Interstates and US highways near AZ/NM -> {(level, route number): line geometry}.
+       If the download fails, maps are still drawn, just without roads."""
     global ROADS
     if ROADS is not None:
         return ROADS
@@ -409,8 +543,9 @@ def load_roads():
         parts, seen_levels = {}, set()
         for rec in shpreader.Reader(path).records():
             a = rec.attributes
+            # Natural Earth stores the road class in "level" (Interstate / Federal / State ...)
             raw = str(a.get('level') or a.get('level_') or '').strip()
-            if a.get('sov_a3') not in (None, 'USA'):
+            if a.get('sov_a3') not in (None, 'USA'):   # US roads only
                 continue
             seen_levels.add(raw)
             low = raw.lower()
@@ -419,10 +554,11 @@ def load_roads():
             elif 'federal' in low or low in ('us', 'u.s.'):
                 level = 'Federal'
             else:
-                continue
+                continue                             # state/local roads are skipped
             geom = rec.geometry
             if geom is None or not geom.intersects(area):
                 continue
+            # Route number for the marker, e.g. "40" from "I-40" or "US 60"
             num = ''
             for field in ('label', 'name', 'routeraw'):
                 m = re.search(r'\d+', str(a.get(field) or ''))
@@ -440,6 +576,7 @@ def load_roads():
 
 
 def longest_line(geom):
+    """Longest continuous stretch of a road (where its marker goes)."""
     if geom.is_empty:
         return None
     if geom.geom_type == 'MultiLineString':
@@ -450,18 +587,27 @@ def longest_line(geom):
 
 
 def draw_roads(ax, extent, levels, fontsize):
+    """Draw road lines + one route marker per road on one map panel.
+       levels = which road classes to draw, e.g. ['Interstate', 'Federal'] (empty = none)."""
+    if not levels:
+        return
     roads = load_roads()
     if not roads:
         return
     x0, x1, y0, y1 = extent
     view = shapely.box(x0, y0, x1, y1)
-    style = {'Interstate': dict(color='#222222', linewidth=1.1),
-             'Federal': dict(color='#444444', linewidth=0.6)}
+
+    # Line look (color/thickness) for each road class.
+    # Use "edgecolor", NOT "color": "color" also fills the shape and draws dark wedges.
+    style = {'Interstate': dict(edgecolor='#222222', linewidth=1.1),
+             'Federal': dict(edgecolor='#444444', linewidth=0.6)}
+    # Marker look: interstates = blue rounded box, US highways = white square box
     shield = {'Interstate': dict(facecolor='#1f4e9c', edgecolor='white', boxstyle='round,pad=0.25'),
               'Federal': dict(facecolor='white', edgecolor='black', boxstyle='square,pad=0.2')}
-    min_len = 0.08 * max(x1 - x0, y1 - y0)     # skip labels on tiny road pieces
+    # No marker on road pieces shorter than this (fraction of the map width); raise to reduce clutter
+    min_len = 0.08 * max(x1 - x0, y1 - y0)
 
-    for level in reversed(levels):              # draw US highways first, interstates on top
+    for level in reversed(levels):              # US highways first, interstates drawn on top
         for (lvl, num), geom in roads.items():
             if lvl != level:
                 continue
@@ -472,14 +618,14 @@ def draw_roads(ax, extent, levels, fontsize):
                               alpha=0.85, zorder=3.5, **style[level])
             line = longest_line(visible)
             if num and line is not None and line.length >= min_len:
-                pt = line.interpolate(0.5, normalized=True)
+                pt = line.interpolate(0.5, normalized=True)       # middle of the longest stretch
                 ax.text(pt.x, pt.y, num, transform=ccrs.PlateCarree(), fontsize=fontsize,
                         fontweight='bold', ha='center', va='center', zorder=6, clip_on=True,
                         color='white' if level == 'Interstate' else 'black', bbox=shield[level])
 
 
 def draw_neighbors(ax, neighbors, extent, fontsize):
-    """Bordering PSAs from other GACCs: gray dashed outline + gray code label (context only)."""
+    """Bordering PSAs from other GACCs: gray dashed outline + gray italic code (context only)."""
     if not neighbors:
         return
     ax.add_geometries([p['geom'] for p in neighbors], ccrs.PlateCarree(), facecolor='none',
@@ -487,7 +633,7 @@ def draw_neighbors(ax, neighbors, extent, fontsize):
     x0, x1, y0, y1 = extent
     for p in neighbors:
         visible = p['geom'].intersection(shapely.box(x0, y0, x1, y1))
-        if visible.is_empty or visible.area < 0.02:
+        if visible.is_empty or visible.area < 0.02:   # skip labels for slivers at the map edge
             continue
         pt = visible.representative_point()
         ax.text(pt.x, pt.y, p['code'], transform=ccrs.PlateCarree(), fontsize=fontsize,
@@ -495,19 +641,26 @@ def draw_neighbors(ax, neighbors, extent, fontsize):
                 bbox=dict(facecolor='white', alpha=0.55, edgecolor='none', pad=0.4))
 
 
+# =====================================================================================
+# SECTION 6 — THE MAPS
+# Each image is 16x9 inches at 120 dpi (1920x1080): 7 day panels + 1 legend panel,
+# laid out 2 rows x 4 columns.
+# =====================================================================================
+
 def make_overview(psas, neighbors, days, fields, cycle):
+    """vent_overview.png — all Southwest PSAs, Days 1–7. No roads (see SECTION 1)."""
     fig = plt.figure(figsize=(16, 9))
     extent = OVERVIEW_EXTENT
     for i, (day, data) in enumerate(zip(days, fields)):
         ax = fig.add_subplot(2, 4, i + 1, projection=ccrs.Mercator())
         ax.set_extent(extent, crs=ccrs.PlateCarree())
-        draw_field(ax, data)
-        ax.add_feature(USSTATES.with_scale('5m'), edgecolor='black', linewidth=1.0, zorder=3)
-        draw_neighbors(ax, neighbors, extent, fontsize=5)
-        draw_roads(ax, extent, OVERVIEW_ROAD_LEVELS, fontsize=4.5)
-        ax.add_geometries([p['geom'] for p in psas], ccrs.PlateCarree(),
+        draw_field(ax, data)                                               # colors
+        ax.add_feature(USSTATES.with_scale('5m'), edgecolor='black', linewidth=1.0, zorder=3)  # states
+        draw_neighbors(ax, neighbors, extent, fontsize=5)                  # gray neighbor PSAs
+        draw_roads(ax, extent, OVERVIEW_ROAD_LEVELS, fontsize=4.5)         # roads (off by default)
+        ax.add_geometries([p['geom'] for p in psas], ccrs.PlateCarree(),   # SW PSA outlines
                           facecolor='none', edgecolor='black', linewidth=0.6, zorder=4)
-        for p in psas:
+        for p in psas:                                                     # SW PSA code labels
             pt = p['geom'].representative_point()
             ax.text(pt.x, pt.y, p['code'], transform=ccrs.PlateCarree(), fontsize=5.5,
                     fontweight='bold', ha='center', va='center', zorder=5,
@@ -516,7 +669,9 @@ def make_overview(psas, neighbors, days, fields, cycle):
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
     fig.suptitle('NBM Max Afternoon Ventilation Rate — Arizona & New Mexico PSAs',
                  fontsize=16, fontweight='bold')
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    # Spacing between panels. hspace = gap between the two rows (raise it if a
+    # day title touches the map above); top = room for the big title.
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.90, wspace=0.06, hspace=0.18)
     out = os.path.join(OUTPUT_DIR, 'vent_overview.png')
     fig.savefig(out, dpi=120, facecolor='white')
     plt.close(fig)
@@ -524,6 +679,8 @@ def make_overview(psas, neighbors, days, fields, cycle):
 
 
 def make_psa_map(psa, psas, neighbors, days, fields, cycle):
+    """vent_<PSA>.png — one PSA zoomed in, Days 1–7, with counties, roads and the PSA median."""
+    # Zoom: the PSA's bounding box plus a margin (raise 0.15 to zoom out more)
     minx, miny, maxx, maxy = psa['geom'].bounds
     pad = 0.15 * max(maxx - minx, maxy - miny) + 0.1
     extent = [minx - pad, maxx + pad, miny - pad, maxy + pad]
@@ -534,17 +691,18 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
     for i, (day, data) in enumerate(zip(days, fields)):
         ax = fig.add_subplot(2, 4, i + 1, projection=ccrs.Mercator())
         ax.set_extent(extent, crs=ccrs.PlateCarree())
-        draw_field(ax, data)
-        ax.add_feature(USCOUNTIES.with_scale('500k'), edgecolor='gray', linewidth=0.4, zorder=2)
-        ax.add_feature(USSTATES.with_scale('500k'), edgecolor='black', linewidth=1.0, zorder=3)
-        draw_neighbors(ax, neighbors, extent, fontsize=7)
-        draw_roads(ax, extent, PSA_ROAD_LEVELS, fontsize=6.5)
-        if others:
+        draw_field(ax, data)                                                                    # colors
+        ax.add_feature(USCOUNTIES.with_scale('500k'), edgecolor='gray', linewidth=0.4, zorder=2)  # counties
+        ax.add_feature(USSTATES.with_scale('500k'), edgecolor='black', linewidth=1.0, zorder=3)   # states
+        draw_neighbors(ax, neighbors, extent, fontsize=7)                                       # gray neighbor PSAs
+        draw_roads(ax, extent, PSA_ROAD_LEVELS, fontsize=6.5)                                   # roads + markers
+        if others:                                                                              # other SW PSAs
             ax.add_geometries(others, ccrs.PlateCarree(), facecolor='none',
                               edgecolor='dimgray', linewidth=0.8, linestyle='--', zorder=3)
-        ax.add_geometries([psa['geom']], ccrs.PlateCarree(), facecolor='none',
+        ax.add_geometries([psa['geom']], ccrs.PlateCarree(), facecolor='none',                  # this PSA (bold)
                           edgecolor='black', linewidth=2.2, zorder=4)
 
+        # Panel title: date + median ventilation inside the PSA and its category
         if data is not None and mask.any():
             with np.errstate(all='ignore'):
                 med = float(np.nanmedian(data[mask]))
@@ -556,14 +714,20 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
     title = f"{psa['code']} {psa['name']}".strip()
     fig.suptitle(f'{title} — NBM Max Afternoon Ventilation Rate', fontsize=16, fontweight='bold')
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    # Spacing between panels. hspace = gap between the two rows; these titles are two
+    # lines, so the gap is bigger. Raise hspace if a title touches the map above.
+    fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.88, wspace=0.06, hspace=0.34)
     out = os.path.join(OUTPUT_DIR, psa['file'])
     fig.savefig(out, dpi=120, facecolor='white')
     plt.close(fig)
     print('saved', out)
 
 
-# ---- Webpage ---------------------------------------------------------------------
+# =====================================================================================
+# SECTION 7 — THE WEBPAGE (index.html)
+# PAGE_CSS controls the look (colors, spacing). write_index_html() controls the content.
+# =====================================================================================
+
 PAGE_CSS = """
 :root { --bg:#f5f6f8; --card:#ffffff; --text:#1d2330; --muted:#5b6475; --line:#d9dde4; --accent:#1f3a93; }
 @media (prefers-color-scheme: dark) {
@@ -592,14 +756,17 @@ img { width:100%; height:auto; display:block; border-radius:6px; background:#fff
 
 
 def write_index_html(psas, days, cycle):
-    stamp = f'{cycle:%Y%m%d%H}'                    # makes browsers load today's images, not cached ones
+    """Build the webpage: header, PSA buttons, overview image, one section per PSA, footnote."""
+    stamp = f'{cycle:%Y%m%d%H}'      # added to image links so browsers load today's images, not cached ones
     built = dt.datetime.now(LOCAL_TZ)
     esc = html.escape
 
+    # Row of buttons at the top (Overview, SW01, SW02, ...)
     nav = ['<a href="#overview">Overview</a>'] + [
         f'<a href="#{esc(re.sub(r"[^A-Za-z0-9]", "", p["code"]))}" title="{esc(p["name"])}">{esc(p["code"])}</a>'
         for p in psas]
 
+    # One box per image
     sections = [
         '<section id="overview"><h2>All AZ/NM PSAs</h2>'
         f'<img src="vent_overview.png?v={stamp}" alt="Ventilation overview, Days 1 to 7"></section>'
@@ -611,6 +778,7 @@ def write_index_html(psas, days, cycle):
             f'<img src="{esc(p["file"])}?v={stamp}" loading="lazy" '
             f'alt="{esc(p["code"])} ventilation, Days 1 to 7"></section>')
 
+    # The page itself. The footnote text at the bottom can be edited freely.
     page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -624,7 +792,7 @@ def write_index_html(psas, days, cycle):
   <h1>{esc(PAGE_TITLE)}</h1>
   <div class="meta">Days 1–7 ({day_label(days[0])} – {day_label(days[-1])}) ·
     NBM {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} run ·
-    daily max of {esc(AFTERNOON_TEXT)} · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
+    daily max · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
 </header>
 <nav><div class="inner">{''.join(nav)}</div></nav>
 <main>
@@ -642,17 +810,25 @@ PSA boundaries: NIFC. Each PSA panel shows the median value inside the PSA.</p>
     print('saved index.html')
 
 
+# =====================================================================================
+# SECTION 8 — MAIN: runs everything in order
+# =====================================================================================
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    # Step 1: PSA boundaries (SECTION 2)
     psas, neighbors = load_psas()
     if not psas:
         sys.exit('No AZ/NM PSAs found.')
 
+    # Step 2: pick the NBM run (SECTION 3). Day 1 = today in Arizona time.
     today = dt.datetime.now(LOCAL_TZ).date()
     days = [today + dt.timedelta(days=i) for i in range(DAYS)]
     cycle = pick_cycle(days)
     print(f'Using NBM {cycle:%Y-%m-%d %H}Z')
 
+    # Step 3: afternoon max ventilation for each day (SECTION 3)
     fields = []
     for day in days:
         print(f'Day {day}:')
@@ -660,10 +836,12 @@ def main():
     if all(f is None for f in fields):
         sys.exit('No NBM ventilation data could be read.')
 
+    # Step 4: maps (SECTION 6)
     make_overview(psas, neighbors, days, fields, cycle)
     for psa in psas:
         make_psa_map(psa, psas, neighbors, days, fields, cycle)
 
+    # Step 5: webpage (SECTION 7)
     write_index_html(psas, days, cycle)
 
 
