@@ -1,0 +1,7 @@
+requests
+numpy
+matplotlib
+cartopy
+metpy
+pygrib
+shapely
