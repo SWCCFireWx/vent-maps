@@ -142,6 +142,18 @@ norm = mcolors.BoundaryNorm(CAT_BOUNDS, cmap.N)
 # NBM gives ventilation in m²/s; this converts to knot-feet.
 MPS_TO_KTFT = (1 / 0.514444) * (1 / 0.3048)
 
+# ---- Spot check (troubleshooting) ----------------------------------------------------
+# For each place below, the GitHub log prints the raw NBM value (m²/s) and the
+# converted value (knot-ft) at every afternoon hour, so you can compare with other data.
+# Add or remove places freely: 'Name': (latitude, longitude)
+CHECK_POINTS = {
+    'Albuquerque': (35.0402, -106.6092),
+    'Flagstaff': (35.1383, -111.6661),
+    'Phoenix': (33.4342, -112.0116),
+    'Roswell': (33.3016, -104.5306),
+    'Silver City': (32.7701, -108.2803),
+}
+
 # ---- Data sources -------------------------------------------------------------------------
 # NBM files are tried on AWS first, then NOAA's NOMADS server.
 # If NOAA moves the files, update these and/or nbm_url() in SECTION 3.
@@ -437,6 +449,10 @@ def read_vrate(cycle, fhr):
     try:
         grbs = pygrib.open(path)
         g = grbs.message(1)
+        # Log line showing exactly what was read: variable name, UNITS, forecast hour.
+        # The units should say m**2 s**-1 (m²/s). If they ever say something else,
+        # MPS_TO_KTFT in SECTION 1 is the wrong conversion.
+        print(f'  f{fhr:03d}: {g}')
         vals = np.ma.filled(np.ma.asarray(g.values, dtype=float), np.nan)
         if Grid.sl is None:
             # First file only: work out which grid rows/columns cover the AZ/NM area
@@ -456,14 +472,28 @@ def read_vrate(cycle, fhr):
     return vals * MPS_TO_KTFT                  # m²/s -> knot-ft
 
 
+def nearest_index(lat, lon):
+    """Grid row/column closest to a lat/lon (for the CHECK_POINTS spot check)."""
+    d = (Grid.lats - lat) ** 2 + ((Grid.lons - lon) * np.cos(np.radians(lat))) ** 2
+    return np.unravel_index(np.nanargmin(d), d.shape)
+
+
 def daily_max(cycle, day):
-    """Highest ventilation of the afternoon hours for one day (per grid point)."""
+    """Highest ventilation of the afternoon hours for one day (per grid point).
+       Also prints the CHECK_POINTS values to the log for troubleshooting."""
     fields = []
     for valid in valid_times_for_day(day):
         f = fhr_for(cycle, valid)
         v = read_vrate(cycle, f)
-        if v is not None:
-            fields.append(v)
+        if v is None:
+            continue
+        fields.append(v)
+        local = valid.astimezone(LOCAL_TZ)
+        for name, (lat, lon) in CHECK_POINTS.items():
+            iy, ix = nearest_index(lat, lon)
+            ktft = v[iy, ix]
+            print(f'    {name:12} {local:%a %m/%d %I %p} MST (f{f:03d}): '
+                  f'{ktft / MPS_TO_KTFT:8.0f} m²/s = {ktft:9,.0f} kt-ft  {category(ktft)}')
     if not fields:
         return None                            # shows as "No data" on the map
     with np.errstate(all='ignore'):
