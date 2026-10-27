@@ -35,7 +35,7 @@ from metpy.plots import USCOUNTIES, USSTATES
 import pygrib
 import shapely
 from shapely.geometry import shape
-from shapely.ops import unary_union
+from shapely.ops import unary_union, linemerge
 
 # ---- Settings ----------------------------------------------------------------
 OUTPUT_DIR = 'site'
@@ -52,6 +52,11 @@ MIN_FRACTION_IN_AZ_NM = 0.5                  # (only used if the file has no GAC
 # (Great Basin, Rocky Mtn, Southern Area, So Cal) is drawn as a gray outline for context.
 MAP_GACC_ID = 'USNMSWC'                      # Southwest Coordination Center
 SHOW_NEIGHBOR_OUTLINES = True
+
+# Roads (Natural Earth 1:10m, downloaded automatically)
+SHOW_ROADS = True
+OVERVIEW_ROAD_LEVELS = ['Interstate']                 # overview panels are small: interstates only
+PSA_ROAD_LEVELS = ['Interstate', 'Federal']           # PSA maps: interstates + US highways
 
 # PSA codes to always skip or always include.
 EXCLUDE_PSAS = set()
@@ -387,6 +392,92 @@ def psa_mask(geom):
     return shapely.contains_xy(geom, Grid.lons, Grid.lats)
 
 
+ROADS = None
+
+
+def load_roads():
+    """Interstates and US highways near AZ/NM from Natural Earth -> {(level, number): geometry}."""
+    global ROADS
+    if ROADS is not None:
+        return ROADS
+    ROADS = {}
+    if not SHOW_ROADS:
+        return ROADS
+    try:
+        path = shpreader.natural_earth(resolution='10m', category='cultural', name='roads')
+        area = shapely.box(lon_min, lat_min, lon_max, lat_max)
+        parts, seen_levels = {}, set()
+        for rec in shpreader.Reader(path).records():
+            a = rec.attributes
+            raw = str(a.get('level') or a.get('level_') or '').strip()
+            if a.get('sov_a3') not in (None, 'USA'):
+                continue
+            seen_levels.add(raw)
+            low = raw.lower()
+            if 'interstate' in low:
+                level = 'Interstate'
+            elif 'federal' in low or low in ('us', 'u.s.'):
+                level = 'Federal'
+            else:
+                continue
+            geom = rec.geometry
+            if geom is None or not geom.intersects(area):
+                continue
+            num = ''
+            for field in ('label', 'name', 'routeraw'):
+                m = re.search(r'\d+', str(a.get(field) or ''))
+                if m:
+                    num = m.group(0)
+                    break
+            parts.setdefault((level, num), []).append(geom.intersection(area))
+        ROADS = {k: unary_union(v) for k, v in parts.items()}
+        print('Road levels in the file:', sorted(seen_levels))
+        print(f'Roads: {sum(1 for k in ROADS if k[0] == "Interstate")} interstates, '
+              f'{sum(1 for k in ROADS if k[0] == "Federal")} US highways')
+    except Exception as e:
+        print(f'Roads: could not load ({e}) - maps will be drawn without roads')
+    return ROADS
+
+
+def longest_line(geom):
+    if geom.is_empty:
+        return None
+    if geom.geom_type == 'MultiLineString':
+        geom = linemerge(geom)
+    lines = list(geom.geoms) if hasattr(geom, 'geoms') else [geom]
+    lines = [g for g in lines if g.geom_type == 'LineString']
+    return max(lines, key=lambda g: g.length) if lines else None
+
+
+def draw_roads(ax, extent, levels, fontsize):
+    roads = load_roads()
+    if not roads:
+        return
+    x0, x1, y0, y1 = extent
+    view = shapely.box(x0, y0, x1, y1)
+    style = {'Interstate': dict(color='#222222', linewidth=1.1),
+             'Federal': dict(color='#444444', linewidth=0.6)}
+    shield = {'Interstate': dict(facecolor='#1f4e9c', edgecolor='white', boxstyle='round,pad=0.25'),
+              'Federal': dict(facecolor='white', edgecolor='black', boxstyle='square,pad=0.2')}
+    min_len = 0.08 * max(x1 - x0, y1 - y0)     # skip labels on tiny road pieces
+
+    for level in reversed(levels):              # draw US highways first, interstates on top
+        for (lvl, num), geom in roads.items():
+            if lvl != level:
+                continue
+            visible = geom.intersection(view)
+            if visible.is_empty:
+                continue
+            ax.add_geometries([visible], ccrs.PlateCarree(), facecolor='none',
+                              alpha=0.85, zorder=3.5, **style[level])
+            line = longest_line(visible)
+            if num and line is not None and line.length >= min_len:
+                pt = line.interpolate(0.5, normalized=True)
+                ax.text(pt.x, pt.y, num, transform=ccrs.PlateCarree(), fontsize=fontsize,
+                        fontweight='bold', ha='center', va='center', zorder=6, clip_on=True,
+                        color='white' if level == 'Interstate' else 'black', bbox=shield[level])
+
+
 def draw_neighbors(ax, neighbors, extent, fontsize):
     """Bordering PSAs from other GACCs: gray dashed outline + gray code label (context only)."""
     if not neighbors:
@@ -413,6 +504,7 @@ def make_overview(psas, neighbors, days, fields, cycle):
         draw_field(ax, data)
         ax.add_feature(USSTATES.with_scale('5m'), edgecolor='black', linewidth=1.0, zorder=3)
         draw_neighbors(ax, neighbors, extent, fontsize=5)
+        draw_roads(ax, extent, OVERVIEW_ROAD_LEVELS, fontsize=4.5)
         ax.add_geometries([p['geom'] for p in psas], ccrs.PlateCarree(),
                           facecolor='none', edgecolor='black', linewidth=0.6, zorder=4)
         for p in psas:
@@ -446,6 +538,7 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
         ax.add_feature(USCOUNTIES.with_scale('500k'), edgecolor='gray', linewidth=0.4, zorder=2)
         ax.add_feature(USSTATES.with_scale('500k'), edgecolor='black', linewidth=1.0, zorder=3)
         draw_neighbors(ax, neighbors, extent, fontsize=7)
+        draw_roads(ax, extent, PSA_ROAD_LEVELS, fontsize=6.5)
         if others:
             ax.add_geometries(others, ccrs.PlateCarree(), facecolor='none',
                               edgecolor='dimgray', linewidth=0.8, linestyle='--', zorder=3)
