@@ -2,9 +2,9 @@ name: Daily ventilation maps
 
 on:
   schedule:
-    - cron: '17 14 * * *'
-    - cron: '47 14 * * *'
-    - cron: '17 16 * * *'
+    - cron: '30 12 * * *'
+    - cron: '30 13 * * *'
+    - cron: '30 14 * * *'
   workflow_dispatch:
 
 permissions:
