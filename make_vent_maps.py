@@ -7,7 +7,7 @@ WHAT THIS DOES
   Every morning GitHub runs this script. It:
     1. Loads the PSA (Predictive Service Area) boundaries            -> SECTION 2
     2. Finds the newest NBM model run and downloads ventilation rate -> SECTION 3
-    3. Takes the afternoon max for each of Days 1–7                  -> SECTION 3
+    3. Averages the afternoon hours for each of Days 1–7            -> SECTION 3
     4. Draws one overview map + one map per Southwest PSA           -> SECTIONS 4–6
     5. Writes the webpage (index.html)                              -> SECTION 7
   Everything is saved in the "site" folder, which GitHub publishes as the webpage.
@@ -101,9 +101,19 @@ SITE_URL = os.environ.get('SITE_URL', '').rstrip('/')
 # ---- Time window ------------------------------------------------------------------------
 DAYS = 7                                # number of forecast days (panels) per map
 LOCAL_TZ = ZoneInfo('America/Phoenix')  # MST all year; decides what "today" (Day 1) is
-# Hours (UTC) checked each day; the map shows the HIGHEST of these.
+# Hours (UTC) used each day.
 # 18 = 11 AM MST, 21 = 2 PM MST, 24 = 5 PM MST (midnight UTC of the next day).
 AFTERNOON_UTC_HOURS = [18, 21, 24]
+# How those hours are combined into one value per day:
+#   'max'     = highest of the hours                                    <- current
+#   'average' = mean of the hours (smoother, ignores one-hour spikes)
+AFTERNOON_METHOD = 'max'
+# Wording used on the maps and webpage for the choice above
+#   legend = legend panel, title = map titles, page = webpage header/footnote
+METHOD_TEXT = {
+    'max':     {'legend': 'Daily max', 'title': 'Max Afternoon', 'page': 'daily max'},
+    'average': {'legend': 'Afternoon average', 'title': 'Average Afternoon', 'page': 'afternoon average'},
+}
 
 # ---- Which PSAs get maps ------------------------------------------------------------
 # PSAs whose GACCUnitID matches this get their own map. Every other PSA nearby
@@ -152,6 +162,7 @@ CHECK_POINTS = {
     'Phoenix': (33.4342, -112.0116),
     'Roswell': (33.3016, -104.5306),
     'Silver City': (32.7701, -108.2803),
+    'Socorro': (34.0584, -106.8914),
 }
 
 # ---- Data sources -------------------------------------------------------------------------
@@ -478,8 +489,9 @@ def nearest_index(lat, lon):
     return np.unravel_index(np.nanargmin(d), d.shape)
 
 
-def daily_max(cycle, day):
-    """Highest ventilation of the afternoon hours for one day (per grid point).
+def afternoon_value(cycle, day):
+    """One value per grid point for the day: the average (or max) of the afternoon hours,
+       set by AFTERNOON_METHOD in SECTION 1.
        Also prints the CHECK_POINTS values to the log for troubleshooting."""
     fields = []
     for valid in valid_times_for_day(day):
@@ -497,7 +509,17 @@ def daily_max(cycle, day):
     if not fields:
         return None                            # shows as "No data" on the map
     with np.errstate(all='ignore'):
-        return np.fmax.reduce(fields)
+        if AFTERNOON_METHOD == 'max':
+            combined = np.fmax.reduce(fields)
+        else:
+            combined = np.nanmean(np.stack(fields), axis=0)
+    # Log the combined value at each check point (this is what the map shows there)
+    for name, (lat, lon) in CHECK_POINTS.items():
+        iy, ix = nearest_index(lat, lon)
+        val = combined[iy, ix]
+        print(f'    {name:12} {METHOD_TEXT[AFTERNOON_METHOD]["legend"].upper():>24}: '
+              f'{val:9,.0f} kt-ft  {category(val)}   <- shown on map')
+    return combined
 
 
 # =====================================================================================
@@ -530,7 +552,7 @@ def legend_panel(ax, cycle):
               fontsize=10, title_fontsize=11, frameon=False)
     ax.text(0.5, 0.18,
             f'Model run: {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year}\n'
-            f'Daily max\n'
+            f'{METHOD_TEXT[AFTERNOON_METHOD]["legend"]}\n'
             f'Categories: NM smoke management',
             ha='center', va='center', fontsize=9, transform=ax.transAxes)
 
@@ -697,7 +719,7 @@ def make_overview(psas, neighbors, days, fields, cycle):
                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none', pad=0.5))
         ax.set_title(f'Day {i + 1}: {day_label(day)}', fontsize=11, fontweight='bold')
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
-    fig.suptitle('Max Afternoon Ventilation Rate — Arizona & New Mexico PSAs',
+    fig.suptitle(f'{METHOD_TEXT[AFTERNOON_METHOD]["title"]} Ventilation Rate — Arizona & New Mexico PSAs',
                  fontsize=16, fontweight='bold')
     # Spacing between panels. hspace = gap between the two rows (raise it if a
     # day title touches the map above); top = room for the big title.
@@ -743,7 +765,7 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
 
     legend_panel(fig.add_subplot(2, 4, 8), cycle)
     title = f"{psa['code']} {psa['name']}".strip()
-    fig.suptitle(f'{title} — Max Afternoon Ventilation Rate', fontsize=16, fontweight='bold')
+    fig.suptitle(f'{title} — {METHOD_TEXT[AFTERNOON_METHOD]["title"]} Ventilation Rate', fontsize=16, fontweight='bold')
     # Spacing between panels. hspace = gap between the two rows; these titles are two
     # lines, so the gap is bigger. Raise hspace if a title touches the map above.
     fig.subplots_adjust(left=0.01, right=0.99, bottom=0.02, top=0.88, wspace=0.06, hspace=0.34)
@@ -822,7 +844,7 @@ def write_index_html(psas, days, cycle):
   <h1>{esc(PAGE_TITLE)}</h1>
   <div class="meta">Days 1–7 ({day_label(days[0])} – {day_label(days[-1])}) ·
     model run {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} ·
-    daily max · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
+    {METHOD_TEXT[AFTERNOON_METHOD]['page']} · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
 </header>
 <nav><div class="inner">{''.join(nav)}</div></nav>
 <main>
@@ -858,11 +880,11 @@ def main():
     cycle = pick_cycle(days)
     print(f'Using NBM {cycle:%Y-%m-%d %H}Z')
 
-    # Step 3: afternoon max ventilation for each day (SECTION 3)
+    # Step 3: afternoon ventilation (average or max) for each day (SECTION 3)
     fields = []
     for day in days:
         print(f'Day {day}:')
-        fields.append(daily_max(cycle, day))
+        fields.append(afternoon_value(cycle, day))
     if all(f is None for f in fields):
         sys.exit('No NBM ventilation data could be read.')
 
