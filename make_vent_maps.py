@@ -9,6 +9,7 @@ WHAT THIS DOES
     2. Finds the NBM model run and downloads ventilation rate (Herbie) -> SECTION 3
     3. Averages the afternoon hours for each of Days 1–7            -> SECTION 3
     4. Draws one overview map + one map per Southwest PSA           -> SECTIONS 4–6
+       + the PSA summary table as an image (vent_table.png)       -> SECTION 6
     5. Writes the webpage (index.html)                              -> SECTION 7
   Everything is saved in the "site" folder, which GitHub publishes as the webpage.
 
@@ -152,6 +153,9 @@ lat_min, lat_max = 30.0, 38.4
 lon_min, lon_max = -116.8, -101.0
 # What the overview map shows: [west, east, south, north]
 OVERVIEW_EXTENT = [-115.9, -101.8, 30.7, 37.9]
+
+# ---- Table image (vent_table.png) ------------------------------------------------------
+TABLE_DARK = True                       # dark background; False = white background
 
 # ---- Colors / categories (knot-ft), New Mexico AQB smoke management table -----------
 # CAT_BOUNDS are the edges between categories; one more number than CAT_NAMES.
@@ -835,6 +839,93 @@ def make_psa_map(psa, psas, neighbors, days, fields, cycle):
     print('saved', out)
 
 
+def make_table_image(psas, days, psa_table, cycle):
+    """vent_table.png — the PSA x Day summary table as an image (same 1920x1080 size as the maps),
+       for linking into a presentation. Same values/colors as the webpage table.
+       Layout numbers (column widths, font sizes) are near the top of this function."""
+    # ---- colors: dark background (set TABLE_DARK = False in SECTION 1 for white) ----
+    if TABLE_DARK:
+        bg, fg, muted, stripe, empty = '#1b2029', '#e6e9ef', '#9aa3b2', '#232934', '#2c3340'
+    else:
+        bg, fg, muted, stripe, empty = 'white', 'black', '#555555', '#f1f3f6', '#d9dde4'
+
+    fig = plt.figure(figsize=(16, 9), facecolor=bg)
+    ax = fig.add_axes([0, 0, 1, 1])
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis('off')
+
+    # ---- layout (fractions of the image) ----
+    left, right = 0.02, 0.98          # table edges
+    top, bottom = 0.855, 0.075        # header row top / last row bottom
+    psa_col = 0.20                    # width of the PSA name column
+    gap = 0.003                       # space between cells
+    n_rows = len(psas) + 1            # +1 for the day header row
+    row_h = (top - bottom) / n_rows
+    day_w = (right - left - psa_col) / len(days)
+    name_size = 10 if len(psas) <= 16 else 8
+    cell_size = 11 if len(psas) <= 16 else 9
+
+    # Title
+    fig.text(0.5, 0.955, f'{METHOD_TEXT[AFTERNOON_METHOD]["title"]} Ventilation Rate — PSA Summary',
+             ha='center', va='center', fontsize=18, fontweight='bold', color=fg)
+    fig.text(0.5, 0.912, 'PSA-wide average (knot-ft) · Arizona & New Mexico',
+             ha='center', va='center', fontsize=11, color=muted)
+
+    # Header row: Day 1 ... Day 7 with dates
+    y = top - row_h
+    ax.text(left + 0.005, y + row_h / 2, 'PSA', ha='left', va='center', fontsize=12, fontweight='bold', color=fg)
+    for j, d in enumerate(days):
+        x = left + psa_col + j * day_w
+        ax.text(x + day_w / 2, y + row_h * 0.62, f'Day {j + 1}', ha='center', va='center',
+                fontsize=12, fontweight='bold', color=fg)
+        ax.text(x + day_w / 2, y + row_h * 0.25, day_label(d), ha='center', va='center',
+                fontsize=10, color=muted)
+
+    # One row per PSA
+    for i, p in enumerate(psas):
+        y = top - (i + 2) * row_h
+        if i % 2 == 0:                # light stripe behind every other PSA name
+            ax.add_patch(plt.Rectangle((left, y + gap / 2), psa_col - gap, row_h - gap,
+                                       facecolor=stripe, edgecolor='none'))
+        ax.text(left + 0.006, y + row_h * 0.64, p['code'], ha='left', va='center',
+                fontsize=name_size + 1, fontweight='bold', color=fg)
+        ax.text(left + 0.006, y + row_h * 0.28, p['name'][:30], ha='left', va='center',
+                fontsize=name_size - 1.5, color=muted)
+        for j, v in enumerate(psa_table.get(p['code'], [])):
+            x = left + psa_col + j * day_w
+            if v is None:
+                face, text, label, sub = empty, muted, '—', ''
+            else:
+                k = CAT_NAMES.index(category(v))
+                face, text, label, sub = CAT_COLORS[k], CAT_TEXT_COLORS[k], CAT_NAMES[k], f'{v / 1000:,.0f}K'
+            ax.add_patch(plt.Rectangle((x + gap / 2, y + gap / 2), day_w - gap, row_h - gap,
+                                       facecolor=face, edgecolor='none'))
+            if sub:
+                ax.text(x + day_w / 2, y + row_h * 0.62, label, ha='center', va='center',
+                        fontsize=cell_size, fontweight='bold', color=text)
+                ax.text(x + day_w / 2, y + row_h * 0.27, sub, ha='center', va='center',
+                        fontsize=cell_size - 2, color=text)
+            else:
+                ax.text(x + day_w / 2, y + row_h / 2, label, ha='center', va='center',
+                        fontsize=cell_size, color=text)
+
+    # Bottom line: color key on the left, issued time + model run on the right
+    kx = left
+    for name, color in zip(CAT_NAMES, CAT_COLORS):
+        ax.add_patch(plt.Rectangle((kx, 0.028), 0.014, 0.022, facecolor=color, edgecolor=muted, lw=0.5))
+        ax.text(kx + 0.019, 0.039, name, ha='left', va='center', fontsize=10, color=fg)
+        kx += 0.075 if len(name) < 8 else 0.095      # space before the next key item
+    ax.text(right, 0.046, issued_text(), ha='right', va='center', fontsize=9, color=muted)
+    ax.text(right, 0.022, f'Model run: {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year}',
+            ha='right', va='center', fontsize=10, color=fg)
+
+    out = os.path.join(OUTPUT_DIR, 'vent_table.png')
+    fig.savefig(out, dpi=120, facecolor=bg)
+    plt.close(fig)
+    print('saved', out)
+
+
 # =====================================================================================
 # SECTION 7 — THE WEBPAGE (index.html)
 # PAGE_CSS controls the look (colors, spacing). write_index_html() controls the content.
@@ -925,7 +1016,9 @@ def summary_table_html(psas, days, psa_table):
     return ('<section id="table"><h2>PSA Ventilation Summary <span>PSA-wide average, knot-ft</span></h2>'
             '<div class="table-wrap"><table class="summary"><thead><tr>' + ''.join(head) + '</tr></thead>'
             '<tbody>' + ''.join(rows) + '</tbody></table></div>'
-            f'<div class="keyrow">{key}</div></section>')
+            f'<div class="keyrow">{key}</div>'
+            '<p class="note" style="margin-top:10px">Image version for presentations: '
+            '<a href="vent_table.png">vent_table.png</a></p></section>')
 
 
 def write_index_html(psas, days, cycle, psa_table):
@@ -1019,8 +1112,12 @@ def main():
     for psa in psas:
         make_psa_map(psa, psas, neighbors, days, fields, cycle)
 
-    # Step 5: webpage (SECTION 7)
-    write_index_html(psas, days, cycle, psa_averages(psas, fields))
+    # Step 5: PSA summary table (image for presentations + table on the webpage)
+    psa_table = psa_averages(psas, fields)
+    make_table_image(psas, days, psa_table, cycle)
+
+    # Step 6: webpage (SECTION 7)
+    write_index_html(psas, days, cycle, psa_table)
 
 
 if __name__ == '__main__':
