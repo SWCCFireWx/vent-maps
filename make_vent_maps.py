@@ -6,7 +6,7 @@
 WHAT THIS DOES
   Every morning GitHub runs this script. It:
     1. Loads the PSA (Predictive Service Area) boundaries            -> SECTION 2
-    2. Finds the newest NBM model run and downloads ventilation rate -> SECTION 3
+    2. Finds the NBM model run and downloads ventilation rate (Herbie) -> SECTION 3
     3. Averages the afternoon hours for each of Days 1–7            -> SECTION 3
     4. Draws one overview map + one map per Southwest PSA           -> SECTIONS 4–6
     5. Writes the webpage (index.html)                              -> SECTION 7
@@ -32,12 +32,16 @@ RUN IT BY HAND (optional, on your own computer)
      SECTION 2 load_psas(). The log line "PSA attribute fields:" shows the field names.
 
  "No recent NBM cycle found on AWS or NOMADS."
-     NOAA changed the NBM folder/file names, or both servers are down.
-     Fix: check the address pattern.                      Code: SECTION 3, nbm_url()
+     NOAA changed the NBM file names, or both servers are down.
+     Fix: usually updating Herbie fixes renamed files (it's in requirements.txt and
+     installs fresh each run). Code: SECTION 3, herbie_for() / is_posted()
 
- "fXXX: no VRATE in this file"  /  every day says "No data"
-     NOAA renamed the ventilation variable inside the files.
-     Fix: check the name 'VRATE'.                          Code: SECTION 3, vrate_byte_range()
+ "fXXX: could not read VRATE ..."  /  every day says "No data"
+     NOAA renamed the ventilation variable, or Herbie couldn't read the file.
+     Fix: check NBM_SEARCH in SECTION 1.                    Code: SECTION 3, read_field()
+
+ "ModuleNotFoundError: No module named 'herbie'"
+     Fix: make sure requirements.txt contains herbie-data.
 
  "Roads: could not load ..."
      The Natural Earth roads download failed. Maps still build, just without roads.
@@ -66,13 +70,14 @@ import re
 import sys
 import json
 import html
+import shutil
 import tempfile
 import zipfile
 import datetime as dt
 from zoneinfo import ZoneInfo
 
 import numpy as np                      # number crunching on the grid
-import requests                         # downloads (NBM, NIFC)
+import requests                         # downloads (NIFC boundaries)
 import matplotlib
 matplotlib.use('Agg')                   # draw to image files (no screen on GitHub)
 import matplotlib.pyplot as plt
@@ -81,7 +86,7 @@ from matplotlib.patches import Patch
 import cartopy.crs as ccrs              # map projections
 import cartopy.io.shapereader as shpreader   # Natural Earth downloads (states, roads)
 from metpy.plots import USCOUNTIES, USSTATES  # county and state outlines
-import pygrib                           # reads NBM GRIB2 files
+from herbie import Herbie               # finds + downloads NBM data (AWS / NOMADS)
 import shapely                          # PSA polygon math
 from shapely.geometry import shape
 from shapely.ops import unary_union, linemerge
@@ -107,6 +112,10 @@ ISSUED_TZ = ZoneInfo('America/Denver')
 # Hours (UTC) used each day.
 # 18 = 11 AM MST, 21 = 2 PM MST, 24 = 5 PM MST (midnight UTC of the next day).
 AFTERNOON_UTC_HOURS = [18, 21, 24]
+# Which NBM runs to use (UTC hour). The NBM 1D Viewer (apps.gsl.noaa.gov/nbmviewer) shows
+# the 07Z and 01Z runs, so using these makes the maps match the viewer's numbers.
+# The newest of these that is posted is used; e.g. [12] would always use the 12Z run.
+PREFERRED_RUN_HOURS = [7, 1]
 # How those hours are combined into one value per day:
 #   'average' = mean of the hours (smoother, ignores one-hour spikes)   <- current
 #   'max'     = highest of the hours
@@ -173,12 +182,15 @@ CHECK_POINTS = {
 }
 
 # ---- Data sources -------------------------------------------------------------------------
-# NBM files are tried on AWS first, then NOAA's NOMADS server.
-# If NOAA moves the files, update these and/or nbm_url() in SECTION 3.
-NBM_SOURCES = [
-    'https://noaa-nbm-grib2-pds.s3.amazonaws.com',
-    'https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod',
-]
+# NBM data is downloaded with Herbie. Where Herbie looks, in order:
+#   'aws'    = noaa-nbm-grib2-pds.s3.amazonaws.com   (NOAA's copy on Amazon)
+#   'nomads' = nomads.ncep.noaa.gov                    (NOAA's own server, backup)
+HERBIE_PRIORITY = ['aws', 'nomads']
+# What Herbie searches for in each NBM file's index. ':VRATE:' = ventilation rate,
+# ':MIXHT:' = mixing height. If NOAA renames a variable, change the text here.
+NBM_SEARCH = {'VRATE': ':VRATE:', 'MIXHT': ':MIXHT:'}
+# Temporary folder for Herbie downloads (emptied after each read)
+HERBIE_DIR = os.path.join(tempfile.gettempdir(), 'herbie_nbm')
 # PSA boundaries: the copy uploaded to the repo is ALWAYS used first (no download).
 # The NIFC addresses below are only a backup if that file is missing.
 PSA_REPO_COPIES = ['psa_boundaries.geojson', 'psa_boundaries.zip']
@@ -358,46 +370,37 @@ def load_psas():
 
 
 # =====================================================================================
-# SECTION 3 — NBM DATA
-# NBM files are large, so only the ventilation (VRATE) piece of each file is downloaded,
-# using the small ".idx" index file that lists where each variable sits in the file.
+# SECTION 3 — NBM DATA (downloaded with Herbie)
+# Herbie (https://herbie.readthedocs.io) finds each NBM file on AWS (or NOMADS as backup)
+# and downloads ONLY the variable asked for (e.g. ventilation rate), not the whole file.
+# Herbie settings are in SECTION 1 (HERBIE_PRIORITY, NBM_SEARCH).
 # =====================================================================================
 
-def nbm_url(base, cycle, fhr):
-    """Address of one NBM CONUS 'core' file, e.g.
-       .../blend.20261027/12/core/blend.t12z.core.f030.co.grib2
-       If NOAA changes its folder or file naming, THIS is the line to fix."""
-    return (f'{base}/blend.{cycle:%Y%m%d}/{cycle:%H}/core/'
-            f'blend.t{cycle:%H}z.core.f{fhr:03d}.co.grib2')
+_HERBIE_CACHE = {}
 
 
-def get_idx(cycle, fhr):
-    """Download the .idx index for one forecast hour. Tries each server in NBM_SOURCES.
-       Returns (grib_url, idx_text), or (None, None) if no server has it yet."""
-    for base in NBM_SOURCES:
-        url = nbm_url(base, cycle, fhr)
-        try:
-            r = requests.get(url + '.idx', timeout=30)
-            if r.status_code == 200 and r.text.strip():
-                return url, r.text
-        except requests.RequestException:
-            pass
-    return None, None
+def herbie_for(cycle, fhr):
+    """Herbie object for one NBM run + forecast hour (reused if asked for again).
+       If NOAA changes NBM file names, updating Herbie (requirements.txt) usually fixes it."""
+    key = (cycle, fhr)
+    if key not in _HERBIE_CACHE:
+        _HERBIE_CACHE[key] = Herbie(
+            cycle.replace(tzinfo=None),          # Herbie wants the run time in UTC, no time zone
+            model='nbm', product='co',           # NBM, CONUS grid
+            fxx=fhr,                             # forecast hour
+            priority=HERBIE_PRIORITY,            # AWS first, then NOMADS
+            save_dir=HERBIE_DIR,                 # temporary download folder
+            verbose=False)
+    return _HERBIE_CACHE[key]
 
 
-def vrate_byte_range(idx_text, var='VRATE'):
-    """Find the ventilation rate (VRATE) entry in the .idx file -> (start byte, end byte).
-       An .idx line looks like:  123:45678901:d=2026102712:VRATE:entire atmosphere ...:6 hour fcst:
-       If NOAA renames the variable, change 'VRATE' here."""
-    lines = [l for l in idx_text.strip().splitlines() if l.strip()]
-    for i, line in enumerate(lines):
-        parts = line.split(':')
-        if len(parts) > 4 and parts[3] == var and 'std dev' not in line and 'prob' not in line:
-            start = int(parts[1])
-            # The piece ends where the next entry starts (or at the end of the file)
-            end = int(lines[i + 1].split(':')[1]) - 1 if i + 1 < len(lines) else None
-            return start, end
-    return None
+def is_posted(cycle, fhr):
+    """True if this run/forecast hour (and its .idx index) is available on AWS or NOMADS."""
+    try:
+        H = herbie_for(cycle, fhr)
+        return H.grib is not None and H.idx is not None
+    except Exception:
+        return False
 
 
 def valid_times_for_day(day):
@@ -412,25 +415,29 @@ def fhr_for(cycle, valid):
 
 
 def pick_cycle(days):
-    """Choose the newest NBM run that already has its Day 7 file posted.
-       Tries today's 18Z, 12Z, 06Z, 00Z, then yesterday's 18Z, 12Z.
-       Runs less than 45 minutes old are skipped (not posted yet)."""
+    """Choose which NBM run to use.
+       First choice: the newest run whose hour is in PREFERRED_RUN_HOURS (SECTION 1) - these
+       are the runs the NBM 1D Viewer uses, so the maps match the viewer.
+       Backup: the newest of the main runs (18Z, 12Z, 06Z, 00Z) if no preferred run is posted.
+       A run must already have its Day 7 file posted (or at least Day 1 as a last resort)."""
     now = dt.datetime.now(dt.timezone.utc)
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    candidates = sorted(
-        [today + dt.timedelta(hours=h) for h in (18, 12, 6, 0)] +
-        [today - dt.timedelta(days=1) + dt.timedelta(hours=h) for h in (18, 12)],
-        reverse=True)
-    candidates = [c for c in candidates if c <= now - dt.timedelta(minutes=45)]
+
+    def runs(hours):
+        c = [today + dt.timedelta(hours=h) for h in hours] + \
+            [today - dt.timedelta(days=1) + dt.timedelta(hours=h) for h in hours]
+        # newest first; skip runs less than 45 minutes old (not posted yet)
+        return sorted([x for x in c if x <= now - dt.timedelta(minutes=45)], reverse=True)
 
     last_valid = valid_times_for_day(days[-1])[-1]
     first_valid = valid_times_for_day(days[0])[0]
-    for c in candidates:                       # best: a run that reaches Day 7
-        if get_idx(c, fhr_for(c, last_valid))[0]:
-            return c
-    for c in candidates:                       # fallback: a run with at least Day 1
+    for candidates in (runs(PREFERRED_RUN_HOURS), runs((18, 12, 6, 0))):
+        for c in candidates:                   # best: a run that reaches Day 7
+            if is_posted(c, fhr_for(c, last_valid)):
+                return c
+    for c in runs(PREFERRED_RUN_HOURS) + runs((18, 12, 6, 0)):   # last resort: at least Day 1
         f = fhr_for(c, first_valid)
-        if f >= 1 and get_idx(c, f)[0]:
+        if f >= 1 and is_posted(c, f):
             return c
     raise RuntimeError('No recent NBM cycle found on AWS or NOMADS.')
 
@@ -447,54 +454,57 @@ def read_vrate(cycle, fhr):
 
 
 def read_field(cycle, fhr, var, quiet=False):
-    """Download just one variable (e.g. 'VRATE' or 'MIXHT') for one forecast hour.
+    """Download one variable (e.g. 'VRATE' or 'MIXHT') for one forecast hour with Herbie.
        Returns the grid in the file's own units (AZ/NM area only), or None if not available."""
     if fhr < 1 or fhr > 264:                   # NBM core files run f001–f264
         return None
-    url, idx = get_idx(cycle, fhr)
-    if not url:
-        print(f'  f{fhr:03d}: not posted')
-        return None
-    rng = vrate_byte_range(idx, var)
-    if not rng:
-        print(f'  f{fhr:03d}: no {var} in this file')
-        return None
-
-    # Download only the bytes for this variable (a "Range" request)
-    start, end = rng
-    headers = {'Range': f'bytes={start}-{end if end is not None else ""}'}
-    r = requests.get(url, headers=headers, timeout=120)
-    r.raise_for_status()
-
-    # pygrib needs a file on disk, so save the piece to a temporary file
-    with tempfile.NamedTemporaryFile(suffix='.grib2', delete=False) as tmp:
-        tmp.write(r.content)
-        path = tmp.name
     try:
-        grbs = pygrib.open(path)
-        g = grbs.message(1)
-        # Log line showing exactly what was read: variable name, UNITS, forecast hour.
-        # The units should say m**2 s**-1 (m²/s). If they ever say something else,
-        # MPS_TO_KTFT in SECTION 1 is the wrong conversion.
-        if not quiet:
-            print(f'  f{fhr:03d}: {g}')
-        vals = np.ma.filled(np.ma.asarray(g.values, dtype=float), np.nan)
-        if Grid.sl is None:
-            # First file only: work out which grid rows/columns cover the AZ/NM area
-            lats, lons = g.latlons()
-            lons = np.where(lons > 180, lons - 360, lons)
-            inside = (lats >= lat_min) & (lats <= lat_max) & (lons >= lon_min) & (lons <= lon_max)
-            rows = np.where(inside.any(axis=1))[0]
-            cols = np.where(inside.any(axis=0))[0]
-            Grid.sl = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1))
-            Grid.lats, Grid.lons = lats[Grid.sl], lons[Grid.sl]
-        grbs.close()
-    finally:
-        os.remove(path)
+        H = herbie_for(cycle, fhr)
+        if H.grib is None or H.idx is None:
+            print(f'  f{fhr:03d}: not posted')
+            return None
+        # Herbie searches the file's index for this text and downloads just that piece.
+        ds = H.xarray(NBM_SEARCH[var], remove_grib=False)
+    except Exception as e:
+        print(f'  f{fhr:03d}: could not read {var} ({str(e)[:150]})')
+        return None
+    if isinstance(ds, list):                   # Herbie returns a list if several pieces match
+        ds = ds[0]
+
+    # The dataset holds one 2-D field (its name depends on the GRIB tables, so don't rely on it)
+    grids = [n for n in ds.data_vars if ds[n].ndim == 2]
+    name = grids[0] if grids else list(ds.data_vars)[0]
+    da = ds[name]
+    if not quiet:
+        # Log line showing what was read. For VRATE the units should be m**2 s**-1 (m²/s);
+        # if they ever say something else, MPS_TO_KTFT in SECTION 1 is the wrong conversion.
+        units = da.attrs.get('units', da.attrs.get('GRIB_units', '?'))
+        print(f'  f{fhr:03d}: {var} -> "{name}" [{units}] '
+              f'valid {str(da.valid_time.values)[:16]} UTC from {H.grib_source}')
+
+    vals = np.asarray(da.values, dtype=float)
+    if Grid.sl is None:
+        # First file only: work out which grid rows/columns cover the AZ/NM area
+        lats = np.asarray(ds.latitude.values, dtype=float)
+        lons = np.asarray(ds.longitude.values, dtype=float)
+        lons = np.where(lons > 180, lons - 360, lons)
+        inside = (lats >= lat_min) & (lats <= lat_max) & (lons >= lon_min) & (lons <= lon_max)
+        rows = np.where(inside.any(axis=1))[0]
+        cols = np.where(inside.any(axis=0))[0]
+        Grid.sl = (slice(rows[0], rows[-1] + 1), slice(cols[0], cols[-1] + 1))
+        Grid.lats, Grid.lons = lats[Grid.sl], lons[Grid.sl]
+    ds.close()
+    clear_downloads()                          # delete the downloaded piece (keeps disk use small)
 
     vals = vals[Grid.sl]
     vals[vals > 1e6] = np.nan                  # NBM marks missing points with huge numbers
     return vals
+
+
+def clear_downloads():
+    """Empty Herbie's temporary download folder."""
+    shutil.rmtree(HERBIE_DIR, ignore_errors=True)
+    os.makedirs(HERBIE_DIR, exist_ok=True)
 
 
 def nearest_index(lat, lon):
@@ -901,6 +911,7 @@ PSA boundaries: NIFC. Each PSA panel shows the median value inside the PSA.</p>
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(HERBIE_DIR, exist_ok=True)
 
     # Step 1: PSA boundaries (SECTION 2)
     psas, neighbors = load_psas()
