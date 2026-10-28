@@ -864,101 +864,70 @@ section h2 { font-size:1.15rem; margin:0 0 8px; }
 section h2 span { color:var(--muted); font-weight:500; }
 img { width:100%; height:auto; display:block; border-radius:6px; background:#fff; }
 .note { color:var(--muted); font-size:0.85rem; margin-top:24px; }
+/* PSA summary table */
+.table-wrap { overflow-x:auto; }
+table.summary { border-collapse:separate; border-spacing:3px; width:100%; min-width:720px; font-size:0.9rem; }
+table.summary th { text-align:center; font-weight:600; padding:6px 4px; color:var(--text); }
+table.summary th.psa { text-align:left; }
+table.summary th .date { display:block; font-weight:500; color:var(--muted); font-size:0.8rem; }
+table.summary td.psa { white-space:nowrap; padding:6px 8px; font-weight:600; }
+/* keep the PSA column in place when the table scrolls sideways on a phone */
+table.summary td.psa, table.summary th.psa { position:sticky; left:0; background:var(--card); z-index:1; }
+table.summary td.psa span { display:block; font-weight:400; color:var(--muted); font-size:0.8rem; }
+table.summary td.cat { text-align:center; padding:8px 4px; border-radius:5px; font-weight:600; line-height:1.2; }
+table.summary td.cat small { display:block; font-weight:400; font-size:0.78rem; opacity:0.9; }
+.keyrow { display:flex; flex-wrap:wrap; gap:6px 14px; margin-top:10px; font-size:0.85rem; color:var(--muted); }
+.keyrow b { display:inline-block; width:14px; height:14px; border-radius:3px; vertical-align:-2px; margin-right:5px; }
 """
 
 
-def write_index_html(psas, days, cycle):
-    """Build the webpage: header, PSA buttons, overview image, one section per PSA, footnote."""
-    stamp = f'{cycle:%Y%m%d%H}'      # added to image links so browsers load today's images, not cached ones
-    built = dt.datetime.now(LOCAL_TZ)
-    esc = html.escape
-
-    # Row of buttons at the top (Overview, SW01, SW02, ...)
-    nav = ['<a href="#overview">Overview</a>'] + [
-        f'<a href="#{esc(re.sub(r"[^A-Za-z0-9]", "", p["code"]))}" title="{esc(p["name"])}">{esc(p["code"])}</a>'
-        for p in psas]
-
-    # One box per image
-    sections = [
-        '<section id="overview"><h2>All AZ/NM PSAs</h2>'
-        f'<img src="vent_overview.png?v={stamp}" alt="Ventilation overview, Days 1 to 7"></section>'
-    ]
+def psa_averages(psas, fields):
+    """PSA-wide average of each day's ventilation (knot-ft): {code: [day1, ..., day7]}.
+       Used for the summary table on the webpage. None = no data that day."""
+    out = {}
     for p in psas:
-        anchor = re.sub(r'[^A-Za-z0-9]', '', p['code'])
-        sections.append(
-            f'<section id="{esc(anchor)}"><h2>{esc(p["code"])} <span>{esc(p["name"])}</span></h2>'
-            f'<img src="{esc(p["file"])}?v={stamp}" loading="lazy" '
-            f'alt="{esc(p["code"])} ventilation, Days 1 to 7"></section>')
-
-    # The page itself. The footnote text at the bottom can be edited freely.
-    page = f"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(PAGE_TITLE)}</title>
-<style>{PAGE_CSS}</style>
-</head>
-<body>
-<header>
-  <h1>{esc(PAGE_TITLE)}</h1>
-  <div class="meta">Days 1–7 ({day_label(days[0])} – {day_label(days[-1])}) ·
-    model run {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} ·
-    {METHOD_TEXT[AFTERNOON_METHOD]['page']} · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
-</header>
-<nav><div class="inner">{''.join(nav)}</div></nav>
-<main>
-{chr(10).join(sections)}
-<p class="note">Ventilation rate = mixing height × transport wind, from the National Blend of Models,
-converted to knot-feet. Categories follow the New Mexico smoke management table:
-Poor &lt;40K, Fair 40–60K, Good 60–100K, Very Good 100–150K, Excellent ≥150K.
-PSA boundaries: NIFC. Each PSA panel shows the median value inside the PSA.</p>
-</main>
-</body>
-</html>
-"""
-    with open(os.path.join(OUTPUT_DIR, 'index.html'), 'w', encoding='utf-8') as f:
-        f.write(page)
-    print('saved index.html')
+        mask = psa_mask(p['geom'])
+        vals = []
+        for data in fields:
+            if data is None or not mask.any():
+                vals.append(None)
+                continue
+            with np.errstate(all='ignore'):
+                v = float(np.nanmean(data[mask]))
+            vals.append(None if np.isnan(v) else v)
+        out[p['code']] = vals
+    return out
 
 
-# =====================================================================================
-# SECTION 8 — MAIN: runs everything in order
-# =====================================================================================
-
-def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    os.makedirs(HERBIE_DIR, exist_ok=True)
-
-    # Step 1: PSA boundaries (SECTION 2)
-    psas, neighbors = load_psas()
-    if not psas:
-        sys.exit('No AZ/NM PSAs found.')
-
-    # Step 2: pick the NBM run (SECTION 3). Day 1 = today in Arizona time.
-    today = dt.datetime.now(LOCAL_TZ).date()
-    days = [today + dt.timedelta(days=i) for i in range(DAYS)]
-    global ISSUED
-    ISSUED = dt.datetime.now(dt.timezone.utc)      # "Issued" time stamped on every map
-    cycle = pick_cycle(days)
-    print(f'Using NBM {cycle:%Y-%m-%d %H}Z')
-
-    # Step 3: afternoon ventilation (average or max) for each day (SECTION 3)
-    fields = []
-    for day in days:
-        print(f'Day {day}:')
-        fields.append(afternoon_value(cycle, day))
-    if all(f is None for f in fields):
-        sys.exit('No NBM ventilation data could be read.')
-
-    # Step 4: maps (SECTION 6)
-    make_overview(psas, neighbors, days, fields, cycle)
-    for psa in psas:
-        make_psa_map(psa, psas, neighbors, days, fields, cycle)
-
-    # Step 5: webpage (SECTION 7)
-    write_index_html(psas, days, cycle)
+# Text color to use on top of each category color (dark text on yellow, white on the rest)
+CAT_TEXT_COLORS = ['#ffffff', '#ffffff', '#ffffff', '#1d2330', '#ffffff']
 
 
-if __name__ == '__main__':
-    main()
+def summary_table_html(psas, days, psa_table):
+    """The PSA x Day table: each cell = category name + PSA-average value, colored by category.
+       Colors/categories come from CAT_BOUNDS / CAT_NAMES / CAT_COLORS in SECTION 1."""
+    esc = html.escape
+    head = ['<th class="psa">PSA</th>'] + [
+        f'<th>Day {i + 1}<span class="date">{esc(day_label(d))}</span></th>' for i, d in enumerate(days)]
+    rows = []
+    for p in psas:
+        cells = [f'<td class="psa">{esc(p["code"])}<span>{esc(p["name"])}</span></td>']
+        for v in psa_table.get(p['code'], []):
+            if v is None:
+                cells.append('<td class="cat" style="background:var(--line);color:var(--muted)">—</td>')
+                continue
+            cat = category(v)
+            i = CAT_NAMES.index(cat)
+            cells.append(f'<td class="cat" style="background:{CAT_COLORS[i]};color:{CAT_TEXT_COLORS[i]}">'
+                         f'{esc(cat)}<small>{v / 1000:,.0f}K</small></td>')
+        rows.append('<tr>' + ''.join(cells) + '</tr>')
+    key = ''.join(f'<span><b style="background:{c}"></b>{esc(n)}</span>' for n, c in zip(CAT_NAMES, CAT_COLORS))
+    return ('<section id="table"><h2>PSA Ventilation Summary <span>PSA-wide average, knot-ft</span></h2>'
+            '<div class="table-wrap"><table class="summary"><thead><tr>' + ''.join(head) + '</tr></thead>'
+            '<tbody>' + ''.join(rows) + '</tbody></table></div>'
+            f'<div class="keyrow">{key}</div></section>')
+
+
+def write_index_html(psas, days, cycle, psa_table):
+    """Build the webpage: header, PSA buttons, summary table, overview image, one section per PSA.
+       psa_table = {psa code: [PSA-average knot-ft for Day 1 ... Day 7]} (see p
