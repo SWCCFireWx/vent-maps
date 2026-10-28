@@ -108,14 +108,14 @@ ISSUED_TZ = ZoneInfo('America/Denver')
 # 18 = 11 AM MST, 21 = 2 PM MST, 24 = 5 PM MST (midnight UTC of the next day).
 AFTERNOON_UTC_HOURS = [18, 21, 24]
 # How those hours are combined into one value per day:
-#   'max'     = highest of the hours                                    <- current
-#   'average' = mean of the hours (smoother, ignores one-hour spikes)
-AFTERNOON_METHOD = 'max'
+#   'average' = mean of the hours (smoother, ignores one-hour spikes)   <- current
+#   'max'     = highest of the hours
+AFTERNOON_METHOD = 'average'
 # Wording used on the maps and webpage for the choice above
 #   legend = legend panel, title = map titles, page = webpage header/footnote
 METHOD_TEXT = {
     'max':     {'legend': 'Daily max', 'title': 'Max Afternoon', 'page': 'daily max'},
-    'average': {'legend': 'Afternoon average', 'title': 'Average Afternoon', 'page': 'afternoon average'},
+    'average': {'legend': 'Afternoon', 'title': 'Afternoon', 'page': 'afternoon values'},
 }
 
 # ---- Which PSAs get maps ------------------------------------------------------------
@@ -159,6 +159,10 @@ MPS_TO_KTFT = (1 / 0.514444) * (1 / 0.3048)
 # For each place below, the GitHub log prints the raw NBM value (m²/s) and the
 # converted value (knot-ft) at every afternoon hour, so you can compare with other data.
 # Add or remove places freely: 'Name': (latitude, longitude)
+# Also log mixing height (ft) and the transport wind it implies (kt) at the check points.
+# This only adds lines to the log; it doesn't change the maps. Costs ~1 extra minute per run.
+LOG_MIXING_HEIGHT = True
+
 CHECK_POINTS = {
     'Albuquerque': (35.0402, -106.6092),
     'Flagstaff': (35.1383, -111.6661),
@@ -381,14 +385,14 @@ def get_idx(cycle, fhr):
     return None, None
 
 
-def vrate_byte_range(idx_text):
+def vrate_byte_range(idx_text, var='VRATE'):
     """Find the ventilation rate (VRATE) entry in the .idx file -> (start byte, end byte).
        An .idx line looks like:  123:45678901:d=2026102712:VRATE:entire atmosphere ...:6 hour fcst:
        If NOAA renames the variable, change 'VRATE' here."""
     lines = [l for l in idx_text.strip().splitlines() if l.strip()]
     for i, line in enumerate(lines):
         parts = line.split(':')
-        if len(parts) > 4 and parts[3] == 'VRATE' and 'std dev' not in line and 'prob' not in line:
+        if len(parts) > 4 and parts[3] == var and 'std dev' not in line and 'prob' not in line:
             start = int(parts[1])
             # The piece ends where the next entry starts (or at the end of the file)
             end = int(lines[i + 1].split(':')[1]) - 1 if i + 1 < len(lines) else None
@@ -437,20 +441,26 @@ class Grid:
 
 
 def read_vrate(cycle, fhr):
-    """Download just the VRATE piece for one forecast hour.
-       Returns the ventilation grid in knot-ft (AZ/NM area only), or None if not available."""
+    """Ventilation rate grid in knot-ft (AZ/NM area only), or None if not available."""
+    vals = read_field(cycle, fhr, 'VRATE')
+    return None if vals is None else vals * MPS_TO_KTFT       # m²/s -> knot-ft
+
+
+def read_field(cycle, fhr, var, quiet=False):
+    """Download just one variable (e.g. 'VRATE' or 'MIXHT') for one forecast hour.
+       Returns the grid in the file's own units (AZ/NM area only), or None if not available."""
     if fhr < 1 or fhr > 264:                   # NBM core files run f001–f264
         return None
     url, idx = get_idx(cycle, fhr)
     if not url:
         print(f'  f{fhr:03d}: not posted')
         return None
-    rng = vrate_byte_range(idx)
+    rng = vrate_byte_range(idx, var)
     if not rng:
-        print(f'  f{fhr:03d}: no VRATE in this file')
+        print(f'  f{fhr:03d}: no {var} in this file')
         return None
 
-    # Download only the bytes for VRATE (a "Range" request)
+    # Download only the bytes for this variable (a "Range" request)
     start, end = rng
     headers = {'Range': f'bytes={start}-{end if end is not None else ""}'}
     r = requests.get(url, headers=headers, timeout=120)
@@ -466,7 +476,8 @@ def read_vrate(cycle, fhr):
         # Log line showing exactly what was read: variable name, UNITS, forecast hour.
         # The units should say m**2 s**-1 (m²/s). If they ever say something else,
         # MPS_TO_KTFT in SECTION 1 is the wrong conversion.
-        print(f'  f{fhr:03d}: {g}')
+        if not quiet:
+            print(f'  f{fhr:03d}: {g}')
         vals = np.ma.filled(np.ma.asarray(g.values, dtype=float), np.nan)
         if Grid.sl is None:
             # First file only: work out which grid rows/columns cover the AZ/NM area
@@ -483,7 +494,7 @@ def read_vrate(cycle, fhr):
 
     vals = vals[Grid.sl]
     vals[vals > 1e6] = np.nan                  # NBM marks missing points with huge numbers
-    return vals * MPS_TO_KTFT                  # m²/s -> knot-ft
+    return vals
 
 
 def nearest_index(lat, lon):
@@ -504,11 +515,19 @@ def afternoon_value(cycle, day):
             continue
         fields.append(v)
         local = valid.astimezone(LOCAL_TZ)
+        # Mixing height (log only - does not change the map). Transport wind isn't in the
+        # gridded NBM, so it is worked out as ventilation / mixing height.
+        mix = read_field(cycle, f, 'MIXHT', quiet=True) if LOG_MIXING_HEIGHT else None
         for name, (lat, lon) in CHECK_POINTS.items():
             iy, ix = nearest_index(lat, lon)
             ktft = v[iy, ix]
-            print(f'    {name:12} {local:%a %m/%d %I %p} MST (f{f:03d}): '
-                  f'{ktft / MPS_TO_KTFT:8.0f} m²/s = {ktft:9,.0f} kt-ft  {category(ktft)}')
+            line = (f'    {name:12} {local:%a %m/%d %I %p} MST (f{f:03d}): '
+                    f'{ktft / MPS_TO_KTFT:8.0f} m²/s = {ktft:9,.0f} kt-ft  {category(ktft)}')
+            if mix is not None and mix[iy, ix] > 0:
+                mh_m = mix[iy, ix]
+                tw_kt = (ktft / MPS_TO_KTFT) / mh_m / 0.514444      # (m²/s ÷ m) = m/s -> knots
+                line += f' | mix hgt {mh_m / 0.3048:7,.0f} ft | transport wind {tw_kt:4.0f} kt (implied)'
+            print(line)
     if not fields:
         return None                            # shows as "No data" on the map
     with np.errstate(all='ignore'):
