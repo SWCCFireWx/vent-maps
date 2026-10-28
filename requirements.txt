@@ -3,5 +3,8 @@ numpy
 matplotlib
 cartopy
 metpy
-pygrib
 shapely
+xarray
+herbie-data
+cfgrib
+eccodes
