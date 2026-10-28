@@ -681,6 +681,20 @@ def longest_line(geom):
     return max(lines, key=lambda g: g.length) if lines else None
 
 
+def line_parts(geom):
+    """Split any road geometry into its individual line stretches (skips stray points)."""
+    if geom.is_empty:
+        return []
+    if geom.geom_type == 'LineString':
+        return [geom]
+    if hasattr(geom, 'geoms'):
+        out = []
+        for g in geom.geoms:
+            out.extend(line_parts(g))
+        return out
+    return []
+
+
 def draw_roads(ax, extent, levels, fontsize):
     """Draw road lines + one route marker per road on one map panel.
        levels = which road classes to draw, e.g. ['Interstate', 'Federal'] (empty = none)."""
@@ -693,9 +707,8 @@ def draw_roads(ax, extent, levels, fontsize):
     view = shapely.box(x0, y0, x1, y1)
 
     # Line look (color/thickness) for each road class.
-    # Use "edgecolor", NOT "color": "color" also fills the shape and draws dark wedges.
-    style = {'Interstate': dict(edgecolor='#222222', linewidth=1.1),
-             'Federal': dict(edgecolor='#444444', linewidth=0.6)}
+    style = {'Interstate': dict(color='#222222', linewidth=1.1),
+             'Federal': dict(color='#444444', linewidth=0.6)}
     # Marker look: interstates = blue rounded box, US highways = white square box
     shield = {'Interstate': dict(facecolor='#1f4e9c', edgecolor='white', boxstyle='round,pad=0.25'),
               'Federal': dict(facecolor='white', edgecolor='black', boxstyle='square,pad=0.2')}
@@ -709,8 +722,12 @@ def draw_roads(ax, extent, levels, fontsize):
             visible = geom.intersection(view)
             if visible.is_empty:
                 continue
-            ax.add_geometries([visible], ccrs.PlateCarree(), facecolor='none',
-                              alpha=0.85, zorder=3.5, **style[level])
+            # Roads are drawn as plain lines (ax.plot), one stretch at a time.
+            # Don't use ax.add_geometries for roads: it can fill them in as dark shapes.
+            for part in line_parts(visible):
+                xs, ys = part.xy
+                ax.plot(xs, ys, transform=ccrs.PlateCarree(), alpha=0.85, zorder=3.5,
+                        solid_capstyle='round', **style[level])
             line = longest_line(visible)
             if num and line is not None and line.length >= min_len:
                 pt = line.interpolate(0.5, normalized=True)       # middle of the longest stretch
