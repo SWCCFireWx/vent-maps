@@ -930,4 +930,98 @@ def summary_table_html(psas, days, psa_table):
 
 def write_index_html(psas, days, cycle, psa_table):
     """Build the webpage: header, PSA buttons, summary table, overview image, one section per PSA.
-       psa_table = {psa code: [PSA-average knot-ft for Day 1 ... Day 7]} (see p
+       psa_table = {psa code: [PSA-average knot-ft for Day 1 ... Day 7]} (see psa_averages())."""
+    stamp = f'{cycle:%Y%m%d%H}'      # added to image links so browsers load today's images, not cached ones
+    built = dt.datetime.now(LOCAL_TZ)
+    esc = html.escape
+
+    # Row of buttons at the top (Overview, SW01, SW02, ...)
+    nav = ['<a href="#overview">Overview</a>', '<a href="#table">Table</a>'] + [
+        f'<a href="#{esc(re.sub(r"[^A-Za-z0-9]", "", p["code"]))}" title="{esc(p["name"])}">{esc(p["code"])}</a>'
+        for p in psas]
+
+    # Page order: overview map, then the PSA summary table, then one box per PSA map
+    sections = [
+        '<section id="overview"><h2>All AZ/NM PSAs</h2>'
+        f'<img src="vent_overview.png?v={stamp}" alt="Ventilation overview, Days 1 to 7"></section>',
+        summary_table_html(psas, days, psa_table),
+    ]
+    for p in psas:
+        anchor = re.sub(r'[^A-Za-z0-9]', '', p['code'])
+        sections.append(
+            f'<section id="{esc(anchor)}"><h2>{esc(p["code"])} <span>{esc(p["name"])}</span></h2>'
+            f'<img src="{esc(p["file"])}?v={stamp}" loading="lazy" '
+            f'alt="{esc(p["code"])} ventilation, Days 1 to 7"></section>')
+
+    # The page itself. The footnote text at the bottom can be edited freely.
+    page = f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(PAGE_TITLE)}</title>
+<style>{PAGE_CSS}</style>
+</head>
+<body>
+<header>
+  <h1>{esc(PAGE_TITLE)}</h1>
+  <div class="meta">Days 1–7 ({day_label(days[0])} – {day_label(days[-1])}) ·
+    model run {cycle:%H}Z {cycle.month}/{cycle.day}/{cycle.year} ·
+    {METHOD_TEXT[AFTERNOON_METHOD]['page']} · updated {built:%-I:%M %p} MST {built.month}/{built.day}</div>
+</header>
+<nav><div class="inner">{''.join(nav)}</div></nav>
+<main>
+{chr(10).join(sections)}
+<p class="note">Ventilation rate = mixing height × transport wind, from the National Blend of Models,
+converted to knot-feet. Categories follow the New Mexico smoke management table:
+Poor &lt;40K, Fair 40–60K, Good 60–100K, Very Good 100–150K, Excellent ≥150K.
+PSA boundaries: NIFC. Each PSA panel shows the median value inside the PSA.</p>
+</main>
+</body>
+</html>
+"""
+    with open(os.path.join(OUTPUT_DIR, 'index.html'), 'w', encoding='utf-8') as f:
+        f.write(page)
+    print('saved index.html')
+
+
+# =====================================================================================
+# SECTION 8 — MAIN: runs everything in order
+# =====================================================================================
+
+def main():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(HERBIE_DIR, exist_ok=True)
+
+    # Step 1: PSA boundaries (SECTION 2)
+    psas, neighbors = load_psas()
+    if not psas:
+        sys.exit('No AZ/NM PSAs found.')
+
+    # Step 2: pick the NBM run (SECTION 3). Day 1 = today in Arizona time.
+    today = dt.datetime.now(LOCAL_TZ).date()
+    days = [today + dt.timedelta(days=i) for i in range(DAYS)]
+    global ISSUED
+    ISSUED = dt.datetime.now(dt.timezone.utc)      # "Issued" time stamped on every map
+    cycle = pick_cycle(days)
+    print(f'Using NBM {cycle:%Y-%m-%d %H}Z')
+
+    # Step 3: afternoon ventilation (average or max) for each day (SECTION 3)
+    fields = []
+    for day in days:
+        print(f'Day {day}:')
+        fields.append(afternoon_value(cycle, day))
+    if all(f is None for f in fields):
+        sys.exit('No NBM ventilation data could be read.')
+
+    # Step 4: maps (SECTION 6)
+    make_overview(psas, neighbors, days, fields, cycle)
+    for psa in psas:
+        make_psa_map(psa, psas, neighbors, days, fields, cycle)
+
+    # Step 5: webpage (SECTION 7)
+    write_index_html(psas, days, cycle, psa_averages(psas, fields))
+
+
+if __name__ == '__main__':
+    main()
