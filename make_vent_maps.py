@@ -117,13 +117,13 @@ AFTERNOON_UTC_HOURS = [18, 21, 24]
 # The newest of these that is posted is used; e.g. [12] would always use the 12Z run.
 PREFERRED_RUN_HOURS = [7, 1]
 # How those hours are combined into one value per day:
-#   'average' = mean of the hours (smoother, ignores one-hour spikes)   <- current
-#   'max'     = highest of the hours
-AFTERNOON_METHOD = 'average'
+#   'max'     = highest of the hours                                    <- current
+#   'average' = mean of the hours (smoother, ignores one-hour spikes)
+AFTERNOON_METHOD = 'max'
 # Wording used on the maps and webpage for the choice above
 #   legend = legend panel, title = map titles, page = webpage header/footnote
 METHOD_TEXT = {
-    'max':     {'legend': 'Daily max', 'title': 'Max Afternoon', 'page': 'daily max'},
+    'max':     {'legend': 'Afternoon', 'title': 'Afternoon', 'page': 'afternoon values'},
     'average': {'legend': 'Afternoon', 'title': 'Afternoon', 'page': 'afternoon values'},
 }
 
